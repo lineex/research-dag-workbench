@@ -1,0 +1,62 @@
+{
+  "name": "dsh-research-dag-workbench",
+  "version": "3.7.0",
+  "type": "module",
+  "description": "鱼骨式研究项目工作台：鱼头规划目标，主脊骨推进阶段，鱼刺探索并无缝融合 DSH 原生交互式会话；成果满意后一键回连主骨。",
+  "license": "MIT",
+  "author": "lineex (https://github.com/lineex)",
+  "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lineex/research-dag-workbench"
+  },
+  "main": "./lib/host.js",
+  "scripts": {
+    "build": "node tools/build-client.mjs",
+    "verify": "node verify/verify-host.mjs && node verify/verify-client.mjs && node verify/verify-layout.mjs && node verify/verify-doc.mjs",
+    "verify:layout": "node verify/verify-layout.mjs",
+    "verify:doc": "node verify/verify-doc.mjs",
+    "pack:check": "node scripts/check-workbench-package.mjs",
+    "preview:layout": "node tools/preview-layout.mjs",
+    "preview": "node tools/render-real.mjs && node tools/shot-proto.mjs .preview/real-render.html .preview/real-render.png 1680 1000",
+    "measure": "node tools/render-real.mjs && node tools/measure-layout.mjs .preview/real-render.html 1680 1000"
+  },
+  "exports": {
+    ".": "./lib/host.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "src/",
+    "docs/images/",
+    "tools/build-client.mjs",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=0.1.5-rc.2 <0.2.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "dsh-desktop-workbenches"
+      ]
+    }
+  }
+}

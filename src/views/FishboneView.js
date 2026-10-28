@@ -1,0 +1,2862 @@
+/**
+ * 研究项目 DAG 工作台 — 鱼骨主线视图（v2.6，真正的鱼形骨架）。
+ *
+ * 布局 = 经典鱼骨图（Ishikawa）：
+ *   - 左侧鱼头：研究目标（可点击清除筛选）；
+ *   - 中间粗脊骨：一条渐变主轴；
+ *   - 每个模块 = 一根从脊骨斜伸出的主刺（上下交错，指向鱼头方向），
+ *     刺尖挂模块名牌（名称 + 完成度 + 刺数）；
+ *   - 每个分支 = 从主刺身上横向长出的细刺（圆点 = 状态色，⚠ = 级联过期）；
+ *   - 右侧鱼尾：整体回连进度。
+ *
+ * 交互：点名牌筛选该模块；点细刺打开智能体工作区；点鱼头/清除按钮取消筛选。
+ * 数据：GET /fishbone。
+ */
+
+
+import { PHASES, SHELL_CSS, STYLES, formatTimeText } from '../core/constants.js'
+import { mi, sep, sub } from '../components/ContextMenu.js'
+
+/** 触发对象右键：向面板层冒泡一个带定位的请求。 */
+function emitContextMenu(options, event, target) {
+  if (!event || typeof event.preventDefault !== 'function') return
+  event.preventDefault()
+  if (event.stopPropagation) event.stopPropagation()
+  if (typeof options.onContextMenu === 'function') {
+    options.onContextMenu({ x: event.clientX, y: event.clientY, target })
+  }
+}
+
+/** 触发鱼刺悬停速览卡（400ms 延迟由面板层控制；这里只报位置与目标）。 */
+function emitHoverCard(options, event, rib) {
+  if (typeof options.onHoverRib === 'function') {
+    options.onHoverRib(rib, { x: event.clientX + 12, y: event.clientY + 10 })
+  }
+}
+function emitHoverCardLeave(options) {
+  if (typeof options.onHoverRibLeave === 'function') options.onHoverRibLeave()
+}
+/**
+ * 鱼刺状态 → 颜色主题。
+ * v3.4：颜色改用 --rdw-* 令牌（SVG 内同样可用 CSS 变量），随宿主明暗主题自适应。
+ */
+const RIB_THEME = {
+  EMPTY: { color: 'var(--rdw-st-draft)', label: '未开工', dot: '○', tone: 'draft' },
+  DRAFT: { color: 'var(--rdw-st-draft)', label: '探路中', dot: '◍', tone: 'draft' },
+  PROVISIONAL: { color: 'var(--rdw-st-provisional)', label: '待回连', dot: '◉', tone: 'provisional' },
+  ACCEPTED: { color: 'var(--rdw-st-accepted)', label: '已回连', dot: '●', tone: 'accepted' },
+  REJECTED: { color: 'var(--rdw-st-rejected)', label: '已修剪', dot: '×', tone: 'rejected' },
+  SUPERSEDED: { color: 'var(--rdw-st-superseded)', label: '旧版本', dot: '◌', tone: 'superseded' },
+  BLOCKED: { color: 'var(--rdw-st-blocked)', label: '受阻', dot: '⊘', tone: 'blocked' },
+}
+
+function ribTheme(status) {
+  return RIB_THEME[status] || RIB_THEME.EMPTY
+}
+
+const RIB_RANK = { PROVISIONAL: 0, DRAFT: 1, BLOCKED: 2, ACCEPTED: 3, REJECTED: 4, SUPERSEDED: 5, EMPTY: 6 }
+
+/**
+ * 模块主刺的配色（EvoResearch 自然有机语汇）。
+ * 选中态用鼠尾草绿（交互色），名牌底色用纸面白，未选中时是中性暖土描边。
+ */
+const BONE = {
+  stroke: 'color-mix(in srgb,var(--rdw-sage-tint) 74%,transparent)',
+  selected: 'var(--rdw-sage)',
+  labelFill: 'var(--rdw-organic-surface)',
+  labelStroke: 'var(--rdw-warm-line)',
+  labelFillSelected: 'color-mix(in srgb,var(--rdw-sage-tint) 18%,var(--rdw-organic-surface))',
+  labelStrokeSelected: 'color-mix(in srgb,var(--rdw-sage) 62%,transparent)',
+}
+
+/** SVG 画布几何。
+ *  画布按模块数自适应加宽（computeViewBox），保证名牌与细刺互不重叠。 */
+const GEO = {
+  W: 1040,
+  H: 480,
+  SPINE_Y: 252,
+  SPINE_X0: 104,
+  SPINE_X1: 908,
+  BONE_LEN: 118,
+  BONE_DX: 52,
+  /** 每根主刺在脊骨上占用的横向宽度（名牌 + 细刺不重叠的关键）。 */
+  SLOT_W: 150,
+  /** 主刺上细刺的分布区间（沿刺身的比例），刻意避开刺尖名牌。 */
+  RIB_FROM: 0.18,
+  RIB_TO: 0.74,
+}
+/** 按字符截断。 */
+function truncate(text, max) {
+  const value = String(text === undefined || text === null ? '' : text).replace(/\s+/g, ' ').trim()
+  if (value.length <= max) return value
+  return `${value.slice(0, Math.max(0, max - 1))}…`
+}
+
+/**
+ * 取一个 spine 节点的「已回连比率」百分比，永不返回 undefined/NaN。
+ *
+ * 为什么需要这个函数（v3.7）：
+ *   真实 `GET /fishbone` 的契约字段是 `completion`（= accepted/total，见 DESIGN §4.2），
+ *   但历史上多个 mock / 旧预览脚本用的是 `progress`。字段一旦漂移，模板字符串会直接
+ *   渲染出 "undefined% · 3 刺" —— 测试全绿、画面出错，正是公理五要防的那类缺陷。
+ *   兜底顺序：completion → progress → 由 counts 现算 → 0。
+ */
+function pctOf(node) {
+  if (!node || typeof node !== 'object') return 0
+  const direct = Number(node.completion)
+  if (Number.isFinite(direct)) return Math.round(direct)
+  const legacy = Number(node.progress)
+  if (Number.isFinite(legacy)) return Math.round(legacy)
+  const counts = node.counts && typeof node.counts === 'object' ? node.counts : null
+  if (counts) {
+    let accepted = 0
+    let total = 0
+    for (const key of Object.keys(counts)) {
+      const value = Number(counts[key]) || 0
+      total += value
+      if (key === 'accepted') accepted += value
+    }
+    if (total > 0) return Math.round((accepted / total) * 100)
+  }
+  return 0
+}
+
+/** 把 spine 按注册顺序排列并标记当前阶段。 */
+function orderSpine(spine, phase) {
+  const list = Array.isArray(spine) ? spine.slice() : []
+  const currentIndex = Math.max(0, PHASES.findIndex(([key]) => key === String(phase || '')))
+  return list.map((node, index) => ({ ...node, isCurrentPhase: index === currentIndex, index }))
+}
+
+/** 一根主刺（含刺尖名牌与刺身上的细刺）。
+ *
+ *  防重叠布局规则（v3.0）：
+ *   - 每个模块在脊骨上独占一个 SLOT_W 宽的槽位，模块多时画布自动加宽；
+ *   - 名牌固定挂在刺尖，向上/下外侧偏移，宽度不超过槽位；
+ *   - 细刺只分布在刺身中段（RIB_FROM..RIB_TO），绝不进入名牌区域；
+ *   - 细刺名称按「同一刺身上交替左右」摆放，避免彼此压字。
+ */
+function renderBone(h, node, index, count, ribs, options) {
+  const { SPINE_Y, BONE_LEN, BONE_DX, SLOT_W, RIB_FROM, RIB_TO } = GEO
+  const selected = options.selectedModule === node.id
+  const dimmed = options.selectedModule && !selected
+  const n = Math.max(count, 1)
+  const slotStart = GEO.SPINE_X0 + GEO.SLOT_W / 2
+  const slotSpan = n * SLOT_W
+  const attachX = n === 1 ? slotStart + slotSpan / 2 : slotStart + index * SLOT_W + SLOT_W / 2
+  const dir = index % 2 === 0 ? -1 : 1
+  const tipX = attachX - BONE_DX
+  const tipY = SPINE_Y + dir * BONE_LEN
+  const moduleRibs = ribs
+    .filter((rib) => rib.module === node.id)
+    .slice()
+    .sort((left, right) => (RIB_RANK[left.status] ?? 9) - (RIB_RANK[right.status] ?? 9))
+  const boneColor = selected ? 'var(--rdw-sage)' : 'color-mix(in srgb,var(--rdw-sage-tint) 74%,transparent)'
+  const accent = node.staleness ? 'var(--rdw-tan-ink)' : node.active ? 'var(--rdw-tan-ink)' : 'var(--rdw-sage)'
+
+  const children = []
+  children.push(
+    h('title', { key: 'tt' }, `${node.name}：${pctOf(node)}% 已回连 · ${moduleRibs.length} 根鱼刺${node.staleness ? ' · 有级联过期' : ''}`),
+  )
+
+  // ---- 刺身骨线（加粗：这是「主骨」的可视锚点）
+  children.push(
+    h('line', {
+      key: 'bone',
+      x1: attachX,
+      y1: SPINE_Y,
+      x2: tipX,
+      y2: tipY,
+      stroke: boneColor,
+      strokeWidth: selected ? 3.2 : 2.2,
+      strokeLinecap: 'round',
+    }),
+  )
+
+  // ---- 刺尖名牌：宽度收敛到槽位内，文字不越界
+  // 名牌是「有机卡片」：纸面底 + 暖土细描边 + 大圆角；选中时用鼠尾草淡底与强调描边。
+  const badgeW = Math.min(SLOT_W - 12, 132)
+  const badgeH = 40
+  // 名牌放在刺尖「远离脊骨」的一侧
+  const badgeY = dir < 0 ? tipY - badgeH - 8 : tipY + 8
+  children.push(
+    h('rect', {
+      key: 'label',
+      x: tipX - badgeW / 2,
+      y: badgeY,
+      width: badgeW,
+      height: badgeH,
+      rx: 13,
+      fill: selected
+        ? 'color-mix(in srgb,var(--rdw-sage-tint) 18%,var(--rdw-organic-surface))'
+        : 'var(--rdw-organic-surface)',
+      stroke: selected
+        ? 'color-mix(in srgb,var(--rdw-sage) 62%,transparent)'
+        : 'var(--rdw-warm-line)',
+      strokeWidth: selected ? 1.6 : 1,
+    }),
+    h(
+      'text',
+      {
+        key: 'name',
+        x: tipX,
+        y: badgeY + 15,
+        textAnchor: 'middle',
+        fontSize: 11.5,
+        fontWeight: 600,
+        fill: 'var(--rdw-organic-ink)',
+        style: { fontFamily: 'var(--rdw-font-serif)' },
+      },
+      truncate(node.name, 9),
+    ),
+    h(
+      'text',
+      {
+        key: 'sub',
+        x: tipX,
+        y: badgeY + 30,
+        textAnchor: 'middle',
+        fontSize: 11.5,
+        fill: accent,
+        fontWeight: 600,
+      },
+      `${pctOf(node)}% · ${moduleRibs.length} 刺${node.staleness ? ' · ⚠' : ''}`,
+    ),
+  )
+
+  // ---- 细刺：只落在刺身中段，左右交替挂标签
+  const ribCount = moduleRibs.length
+  moduleRibs.forEach((rib, j) => {
+    const f = ribCount === 1 ? (RIB_FROM + RIB_TO) / 2 : RIB_FROM + ((RIB_TO - RIB_FROM) * j) / (ribCount - 1)
+    const px = attachX + (tipX - attachX) * f
+    const py = SPINE_Y + (tipY - SPINE_Y) * f
+    const theme = ribTheme(rib.status)
+    const isRibSelected = options.selectedRib === rib.id
+    const fileCount = (rib.workFiles ? rib.workFiles.length : 0) + (rib.outputFiles ? rib.outputFiles.length : 0)
+    // 交替：偶数根挂左侧，奇数根挂右侧，彻底避免同名压字
+    const toLeft = j % 2 === 0
+    const armLen = 26
+    const labelX = toLeft ? px - armLen : px + armLen
+    const labelAnchor = toLeft ? 'end' : 'start'
+
+    children.push(
+      h(
+        'g',
+        {
+          key: `rib-${rib.id}`,
+          role: 'button',
+          tabIndex: 0,
+          style: { cursor: 'pointer' },
+          opacity: isRibSelected ? 1 : dimmed ? 0.4 : 0.94,
+          onClick: (event) => {
+            if (event && event.stopPropagation) event.stopPropagation()
+            if (typeof options.onSelectRib === 'function') options.onSelectRib(rib)
+          },
+          onContextMenu: (event) => emitContextMenu(options, event, { kind: 'rib', rib, module: node }),
+          onMouseEnter: (event) => emitHoverCard(options, event, rib),
+          onMouseLeave: () => emitHoverCardLeave(options),
+          onKeyDown: (event) => {
+            if (event && (event.key === 'Enter' || event.key === ' ')) options.onSelectRib(rib)
+          },
+        },
+        h('title', null, `${rib.name} · ${theme.label} · ${fileCount} 个文件${rib.is_stale ? ' · ⚠ 级联过期' : ''}`),
+        // 横向短刺
+        h('line', {
+          x1: px,
+          y1: py,
+          x2: labelX,
+          y2: py,
+          stroke: theme.color,
+          strokeWidth: isRibSelected ? 2.4 : 1.6,
+          strokeLinecap: 'round',
+        }),
+        h('circle', {
+          cx: px,
+          cy: py,
+          r: isRibSelected ? 4.4 : 3.2,
+          fill: theme.color,
+          stroke: 'var(--rdw-organic-surface)',
+          strokeWidth: 1.2,
+        }),
+        // 名称：贴着短刺末端，字号略小并截断，保证不越出槽位
+        h(
+          'text',
+          {
+            x: labelX + (toLeft ? -4 : 4),
+            y: py + 3.5,
+            textAnchor: labelAnchor,
+            fontSize: 12,
+            fill: isRibSelected ? theme.color : 'var(--rdw-organic-ink-2)',
+            opacity: isRibSelected ? 1 : 0.92,
+            fontWeight: isRibSelected ? 600 : 400,
+          },
+          `${rib.is_stale ? '⚠' : ''}${truncate(rib.name, 7)}${rib.hasSession ? ' 🧠' : ''}`,
+        ),
+      ),
+    )
+  })
+
+  // ---- 选中该主刺时，名牌外侧出现「+ 分刺」
+  if (selected && typeof options.onSproutHere === 'function') {
+    const btnY = dir < 0 ? badgeY - 28 : badgeY + badgeH + 8
+    children.push(
+      h(
+        'g',
+        {
+          key: 'sprout-here',
+          role: 'button',
+          tabIndex: 0,
+          style: { cursor: 'pointer' },
+          onClick: (event) => {
+            if (event && event.stopPropagation) event.stopPropagation()
+            options.onSproutHere(node.id)
+          },
+          onKeyDown: (event) => {
+            if (event && (event.key === 'Enter' || event.key === ' ')) options.onSproutHere(node.id)
+          },
+        },
+        h('title', null, `从「${node.name}」分出一根新鱼刺`),
+        h('rect', {
+          x: tipX - 31,
+          y: btnY,
+          width: 62,
+          height: 21,
+          rx: 10,
+          fill: 'color-mix(in srgb,var(--rdw-sage-tint) 20%,var(--rdw-organic-surface))',
+          stroke: 'color-mix(in srgb,var(--rdw-sage) 52%,transparent)',
+          strokeWidth: 1.2,
+        }),
+        h(
+          'text',
+          { x: tipX, y: btnY + 14.5, textAnchor: 'middle', fontSize: 12, fill: 'var(--rdw-sage)', fontWeight: 600 },
+          '+ 分刺',
+        ),
+      ),
+    )
+  }
+
+  // ---- 悬停在主刺身上（名牌区域之外）时，沿法线方向浮出一根幻影刺
+  const showPhantom = selected && typeof options.onPhantomSprout === 'function' && !options.inlineSprout
+  if (showPhantom) {
+    // 幻影刺起止点：从刺身中点沿「远离脊骨」方向伸出
+    const f = (RIB_FROM + RIB_TO) / 2
+    const px = attachX + (tipX - attachX) * f
+    const py = SPINE_Y + (tipY - SPINE_Y) * f
+    const nx = tipX - attachX
+    const ny = tipY - SPINE_Y
+    const len = Math.sqrt(nx * nx + ny * ny) || 1
+    // 法线方向（垂直刺身，指向名牌一侧）
+    const nxu = (-ny / len) * 34
+    const nyu = (nx / len) * 34
+    const ex = px + nxu
+    const ey = py + nyu
+    children.push(
+      h(
+        'g',
+        {
+          key: 'phantom',
+          className: 'rdw-phantom',
+          style: { pointerEvents: 'none' },
+        },
+        h('line', {
+          x1: px, y1: py, x2: ex, y2: ey,
+          stroke: 'var(--rdw-sage)',
+          strokeWidth: 2,
+          strokeDasharray: '4 4',
+          strokeLinecap: 'round',
+        }),
+        h('circle', { cx: ex, cy: ey, r: 7, fill: 'var(--rdw-organic-surface)', stroke: 'var(--rdw-sage)', strokeWidth: 1.4 }),
+        h('text', { x: ex, y: ey + 3.4, textAnchor: 'middle', fontSize: 11, fill: 'var(--rdw-sage)', fontWeight: 700 }, '+'),
+      ),
+    )
+    // 透明加宽热区：实际接收点击的命中区（SVG 里 pointer-events 不受 className 控制，单独画一条粗透明线）
+    children.push(
+      h('line', {
+        key: 'phantom-hit',
+        x1: px, y1: py, x2: ex, y2: ey,
+        stroke: 'rgba(0,0,0,0)',
+        strokeWidth: 18,
+        strokeLinecap: 'round',
+        style: { pointerEvents: 'all', cursor: 'copy' },
+        onClick: (event) => {
+          if (event && event.stopPropagation) event.stopPropagation()
+          options.onPhantomSprout(node, { x: event.clientX, y: event.clientY })
+        },
+        onContextMenu: (event) => emitContextMenu(options, event, { kind: 'gap', module: node }),
+      }),
+    )
+  }
+
+  return h(
+    'g',
+    {
+      key: `bone-${node.id}`,
+      role: 'button',
+      tabIndex: 0,
+      opacity: dimmed ? 0.35 : 1,
+      style: { cursor: 'pointer', transition: 'opacity .16s ease' },
+      onClick: () => options.onSelectModule(selected ? null : node.id),
+      onContextMenu: (event) => emitContextMenu(options, event, { kind: 'module', module: node }),
+      onKeyDown: (event) => {
+        if (event && (event.key === 'Enter' || event.key === ' ')) options.onSelectModule(selected ? null : node.id)
+      },
+    },
+    ...children,
+  )
+}
+
+/** 按模块数计算画布宽度：模块多时加宽，保证名牌与细刺各自有槽位。 */
+function computeViewBoxWidth(count) {
+  const need = GEO.SPINE_X0 + 40 + Math.max(1, count) * GEO.SLOT_W + 150
+  return Math.max(GEO.W, need)
+}
+
+/**
+ * 鱼骨全景 SVG：鱼头 + 渐变脊骨 + 上下交错主刺 + 细刺 + 鱼尾。
+ */
+function renderFishSvg(h, spine, ribs, totals, options) {
+  const { H, SPINE_Y, SPINE_X0 } = GEO
+  const selected = options.selectedModule || null
+  const elements = []
+  // 自适应：画布宽度随模块数增长，脊骨右端与鱼尾随之右移
+  const W = computeViewBoxWidth(spine.length)
+  const SPINE_X1 = W - 132
+
+  // 脊骨渐变：鼠尾草绿 → 暖沙（EvoResearch 自然有机语汇，禁冷蓝与彩虹渐变）。
+  elements.push(
+    h(
+      'defs',
+      { key: 'defs' },
+      h(
+        'linearGradient',
+        { id: 'fishSpineGrad', x1: '0%', y1: '0%', x2: '100%', y2: '0%' },
+        h('stop', { offset: '0%', stopColor: 'var(--rdw-sage)' }),
+        h('stop', { offset: '100%', stopColor: 'var(--rdw-tan)' }),
+      ),
+    ),
+  )
+
+  // 顶部项目标题（衬线体，手写笔记气质）
+  elements.push(
+    h(
+      'text',
+      {
+        key: 'title',
+        x: 14,
+        y: 24,
+        fontSize: 12.5,
+        fontWeight: 600,
+        fill: 'var(--rdw-organic-ink)',
+        style: { fontFamily: 'var(--rdw-font-serif)' },
+      },
+      `🐟 ${truncate(options.projectTitle || '', 30)}`,
+    ),
+    h(
+      'text',
+      { key: 'goal', x: 14, y: 41, fontSize: 12, fill: 'var(--rdw-organic-ink-3)' },
+      truncate(options.projectGoal || '', 52),
+    ),
+  )
+
+  // 鱼尾（整体回连进度）：暖雾底 + 鼠尾草描边
+  elements.push(
+    h(
+      'g',
+      { key: 'tail' },
+      h('polygon', {
+        points: `${SPINE_X1 + 2},${SPINE_Y} ${SPINE_X1 + 84},208 ${SPINE_X1 + 56},${SPINE_Y} ${SPINE_X1 + 84},296`,
+        fill: 'color-mix(in srgb,var(--rdw-mist) 70%,transparent)',
+        stroke: 'color-mix(in srgb,var(--rdw-sage-tint) 58%,transparent)',
+        strokeWidth: 1.5,
+      }),
+      h(
+        'text',
+        { x: SPINE_X1 + 46, y: 336, textAnchor: 'middle', fontSize: 12, fill: 'var(--rdw-organic-ink-2)' },
+        `${totals.accepted || 0}/${totals.ribs || 0} 已回连`,
+      ),
+    ),
+  )
+
+  // 脊骨：主脊骨是整个视图的锚点，必须「一定看得见」。
+  // 三层叠画，任何一层失效（渐变 id 冲突/主题覆盖）都还有下一层兜底：
+  //   1) 外发光（低透明度，撑出体量）
+  //   2) 实色核心（不依赖渐变，永远可见）
+  //   3) 渐变高光（叠在核心上，提供单色相的阶段感）
+  elements.push(
+    h('line', {
+      key: 'spine-glow',
+      x1: SPINE_X0,
+      y1: SPINE_Y,
+      x2: SPINE_X1,
+      y2: SPINE_Y,
+      stroke: 'color-mix(in srgb,var(--rdw-sage-tint) 26%,transparent)',
+      strokeWidth: 14,
+      strokeLinecap: 'round',
+    }),
+    h('line', {
+      key: 'spine-core',
+      x1: SPINE_X0,
+      y1: SPINE_Y,
+      x2: SPINE_X1,
+      y2: SPINE_Y,
+      stroke: 'var(--rdw-sage)',
+      strokeWidth: 5,
+      strokeLinecap: 'round',
+    }),
+    h('line', {
+      key: 'spine',
+      x1: SPINE_X0,
+      y1: SPINE_Y,
+      x2: SPINE_X1,
+      y2: SPINE_Y,
+      stroke: 'url(#fishSpineGrad)',
+      strokeWidth: 4,
+      strokeLinecap: 'round',
+      opacity: 0.9,
+    }),
+  )
+
+  // 鱼头（点击 = 清除筛选）：暖雾底 + 鼠尾草描边
+  elements.push(
+    h(
+      'g',
+      {
+        key: 'head',
+        role: 'button',
+        tabIndex: 0,
+        style: { cursor: 'pointer' },
+        onClick: () => options.onSelectModule(null),
+        onContextMenu: (event) => emitContextMenu(options, event, { kind: 'head', head: { title: options.projectTitle, goal: options.projectGoal } }),
+        onKeyDown: (event) => {
+          if (event && (event.key === 'Enter' || event.key === ' ')) options.onSelectModule(null)
+        },
+      },
+      h('title', null, '鱼头 · 研究目标（点击清除筛选）'),
+      h('polygon', {
+        points: `${SPINE_X0},${SPINE_Y - 46} ${SPINE_X0},${SPINE_Y + 46} 24,${SPINE_Y}`,
+        fill: 'color-mix(in srgb,var(--rdw-sage-tint) 18%,var(--rdw-organic-surface))',
+        stroke: 'color-mix(in srgb,var(--rdw-sage-tint) 52%,transparent)',
+        strokeWidth: 2,
+        strokeLinejoin: 'round',
+      }),
+      h('circle', { cx: 72, cy: SPINE_Y - 6, r: 5, fill: 'var(--rdw-organic-ink-3)' }),
+      h('path', {
+        d: `M86,${SPINE_Y - 28} Q74,${SPINE_Y} 86,${SPINE_Y + 28}`,
+        stroke: 'color-mix(in srgb,var(--rdw-sage-tint) 58%,transparent)',
+        strokeWidth: 1.5,
+        fill: 'none',
+      }),
+      h(
+        'text',
+        { x: 52, y: SPINE_Y + 74, textAnchor: 'middle', fontSize: 12, fill: 'var(--rdw-organic-ink-3)' },
+        '鱼头 · 目标',
+      ),
+    ),
+  )
+
+  // 脊骨 attachment 点（与 renderBone 的槽位排布一致）
+  const n = spine.length
+  const slotStart = SPINE_X0 + GEO.SLOT_W / 2
+  spine.forEach((node, index) => {
+    const attachX = n === 1 ? slotStart + GEO.SLOT_W / 2 : slotStart + index * GEO.SLOT_W + GEO.SLOT_W / 2
+    elements.push(
+      h('circle', {
+        key: `dot-${node.id}`,
+        cx: attachX,
+        cy: SPINE_Y,
+        r: 4.5,
+        fill: 'var(--rdw-organic-surface)',
+        stroke: 'color-mix(in srgb,var(--rdw-sage-tint) 74%,transparent)',
+        strokeWidth: 1.4,
+      }),
+    )
+  })
+
+  // 主刺
+  spine.forEach((node, index) => {
+    elements.push(renderBone(h, node, index, n, ribs, { ...options, selectedModule: selected }))
+  })
+
+  // 还没有模块时，在脊骨上标注「主任务沿这条脊骨推进」
+  if (n === 0) {
+    elements.push(
+      h(
+        'text',
+        {
+          key: 'spine-hint',
+          x: (SPINE_X0 + SPINE_X1) / 2,
+          y: SPINE_Y - 16,
+          textAnchor: 'middle',
+          fontSize: 11,
+          fill: 'var(--rdw-sage)',
+          fontWeight: 600,
+          opacity: 0.9,
+        },
+        '主任务沿这条脊骨推进 —— 遇到复杂子问题时再分刺',
+      ),
+    )
+  }
+
+  return h(
+    'svg',
+    {
+      viewBox: `0 0 ${W} ${H}`,
+      preserveAspectRatio: 'xMidYMid meet',
+      className: 'rdw-fish-svg',
+      style: {
+        // 窄栏里等比缩小会压成一条看不清的细带；
+        // 给一个最小可读高度，多余部分交给外层横向滚动（滚动条比压扁更可读）。
+        // 极窄容器的下限由 .rdw-fish-svg 的容器查询兜底（见 constants 的 SHELL_CSS）。
+        width: '100%',
+        maxWidth: `${W}px`,
+        minWidth: 560,
+        height: 'auto',
+        minHeight: 260,
+        display: 'block',
+        color: 'inherit',
+      },
+      role: 'img',
+      'aria-label': '研究项目鱼骨图（右键任意对象打开操作菜单）',
+      onContextMenu: (event) => emitContextMenu(options, event, { kind: 'canvas' }),
+    },
+    ...elements,
+  )
+}
+
+/**
+ * 三栏式 EvoResearch 科研工作台（对齐用户指定布局设计）：
+ * - 左栏 · 竖向鱼骨（研究规划与分支导航）：鱼头 + 竖向连续脊骨节点 + 各分支 + [🌱 创建分支]
+ * - 中栏 · 当前工作区：主线/分支任务、绑定智能体身份、往来指令对白流、指令输入区
+ * - 右栏 · 结果面板：本任务产物清单、合并状态、[审核与合并设计]
+ */
+function renderEvoThreePaneWorkbench(h, { head, spine, ribs, totals, options, nextSteps = [], blockers = [], attention = [], markers = [] }) {
+  const { card, row, chip, button, primaryButton, muted } = STYLES
+  const call = (handler, ...args) => {
+    if (typeof handler === 'function') handler(...args)
+  }
+  // v3.5 快捷键：N 分刺 / Del 删刺 / ⌘Z 撤销 / ⇧⌘Z 或 ⌘Y 重做 / ? 帮助
+  const onStageKeyDown = (event) => {
+    if (!event) return
+    const tag = event.target && event.target.tagName ? String(event.target.tagName).toLowerCase() : ''
+    if (tag === 'input' || tag === 'textarea' || (event.target && event.target.isContentEditable)) return
+    const meta = event.metaKey || event.ctrlKey
+    const key = String(event.key || '').toLowerCase()
+    if (key === 'n' && !meta) {
+      event.preventDefault()
+      call(options.onSprout, options.selectedModule || (spine[0] && spine[0].id), options.selectedRib || null)
+      return
+    }
+    if (key === 'delete' || key === 'backspace') {
+      if (options.selectedRib && typeof options.onDeleteRib === 'function') {
+        event.preventDefault()
+        const rib = ribs.find((r) => r.id === options.selectedRib)
+        if (rib) options.onDeleteRib(rib)
+      }
+      return
+    }
+    if (key === 'z' && meta && !event.shiftKey) {
+      event.preventDefault()
+      call(options.onUndo)
+      return
+    }
+    if ((key === 'z' && meta && event.shiftKey) || (key === 'y' && meta)) {
+      event.preventDefault()
+      call(options.onRedo)
+      return
+    }
+    if (key === '?') {
+      event.preventDefault()
+      call(options.onShowShortcuts)
+    }
+  }
+  const session = options.session && typeof options.session === 'object' ? options.session : null
+  const ribList = Array.isArray(ribs) ? ribs : []
+  const spineList = Array.isArray(spine) ? spine : []
+  const candidateRibs = options.selectedModule
+    ? ribList.filter((r) => r && r.module === options.selectedModule)
+    : ribList
+  const defaultRib = candidateRibs[0] || ribList[0] || null
+  const selectedRibId = options.selectedRib || (session && session.branch) || (defaultRib && defaultRib.id) || null
+  const activeRib = (selectedRibId && ribList.find((r) => r.id === selectedRibId)) || defaultRib || {
+    id: selectedRibId || 'B01',
+    name: '任务工作区',
+    module: options.selectedModule || (spineList[0] && spineList[0].id) || 'M10',
+    status: 'PROVISIONAL',
+  }
+  const selectedModId = (activeRib && activeRib.module) || options.selectedModule || (session && session.module) || (spineList[0] && spineList[0].id) || null
+  const activeModule = (selectedModId && spineList.find((m) => m.id === selectedModId)) || spineList[0] || {
+    id: selectedModId || 'M10',
+    name: '研究主线',
+  }
+  const draft = typeof options.directiveDraft === 'string' ? options.directiveDraft : ''
+  const sending = Boolean(options.sending)
+
+  // 1. 左栏 · 竖向鱼骨（研究规划与分支导航）
+  //    样式参照 Karbo123/DSH-EvoResearch 的会话导航栏（evo-threadlist）：
+  //    纸纹底 + 衬线栏标题 + 分组小标题 + 行内有机圆点 + 选中左竖条 + 悬停暖洗。
+  const leftPane = h(
+    'div',
+    {
+      style: {
+        margin: 0,
+        padding: '12px 10px 10px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+        minHeight: 0,
+        background: 'var(--rdw-organic-bg)',
+        backgroundImage: 'var(--rdw-organic-grain)',
+        border: '1px solid var(--rdw-warm-line-2)',
+        borderRadius: 'var(--rdw-r-blob)',
+      },
+    },
+    // 栏标题（衬线体，承担「手写笔记」气质）
+    h(
+      'div',
+      { style: { padding: '0 6px 2px', display: 'flex', alignItems: 'baseline', gap: 6 } },
+      h(
+        'div',
+        {
+          style: {
+            fontFamily: 'var(--rdw-font-serif)',
+            fontSize: 16.5,
+            fontWeight: 600,
+            letterSpacing: '-.01em',
+            color: 'var(--rdw-organic-ink)',
+          },
+        },
+        '竖向鱼骨',
+      ),
+      h(
+        'div',
+        { style: { fontSize: 12, color: 'var(--rdw-organic-ink-3)', letterSpacing: '.2px' } },
+        '研究规划与分支导航',
+      ),
+    ),
+    // 鱼头 · 研究总目标（有机 pebble 卡片 + 左侧重音竖条；右键打开鱼头菜单）
+    h(
+      'div',
+      {
+        onContextMenu: (event) => emitContextMenu(options, event, { kind: 'head', head }),
+        style: {
+          padding: '9px 11px',
+          borderRadius: 'var(--rdw-r-pebble)',
+          background: 'color-mix(in srgb,var(--rdw-sage-tint) 13%,var(--rdw-organic-surface))',
+          border: '1px solid color-mix(in srgb,var(--rdw-sage-tint) 34%,transparent)',
+          borderLeft: '3px solid var(--rdw-sage)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 3,
+        },
+      },
+      h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: 5 } },
+        h('span', { style: { fontSize: 11 } }, '🐟'),
+        h(
+          'span',
+          {
+            style: {
+              fontSize: 12,
+              fontWeight: 700,
+              letterSpacing: '.04em',
+              color: 'var(--rdw-tan-ink)',
+            },
+          },
+          '鱼头 · 研究目标',
+        ),
+      ),
+      h(
+        'div',
+        {
+          style: {
+            fontFamily: 'var(--rdw-font-serif)',
+            fontSize: 12.5,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            color: 'var(--rdw-organic-ink)',
+          },
+        },
+        head.title || '重症低磷血症患者早期补磷',
+      ),
+      h(
+        'div',
+        { style: { fontSize: 12, color: 'var(--rdw-organic-ink-3)', lineHeight: 1.45 } },
+        head.goal ? truncate(head.goal, 56) : '目标试验模拟 · Target Trial Emulation',
+      ),
+    ),
+    // 分组小标题
+    h(
+      'div',
+      {
+        style: {
+          padding: '6px 8px 2px',
+          fontSize: 12.5,
+          fontWeight: 600,
+          letterSpacing: '.3px',
+          textTransform: 'uppercase',
+          color: 'var(--rdw-organic-ink-3)',
+        },
+      },
+      '主脊骨 · 研究主线',
+    ),
+    // 竖向连续脊骨节点（可滚动区）
+    h(
+      'div',
+      {
+        className: 'rdw-organic-scroll',
+        style: {
+          flex: '1 1 auto',
+          minHeight: 0,
+          overflowY: 'auto',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 1,
+          paddingRight: 2,
+        },
+      },
+      ...spine.map((mod, idx) => {
+        const isModSelected = selectedModId === mod.id
+        const modRibs = ribs.filter((r) => r.module === mod.id)
+        const isCompleted = pctOf(mod) === 100
+
+        return h(
+          'div',
+          { key: `v-spine-${mod.id}`, style: { display: 'flex', flexDirection: 'column' } },
+          // 纵向脊骨连线（暖土发丝线，非蓝管线）
+          idx > 0
+            ? h('div', {
+                style: {
+                  width: 1.5,
+                  height: 9,
+                  background: 'color-mix(in srgb,var(--rdw-sage-tint) 52%,transparent)',
+                  margin: '0 0 0 15px',
+                },
+              })
+            : null,
+          // 主骨节点行（会话列表行语言：选中左竖条 + 悬停暖洗 + pebble 圆角）
+          h(
+            'div',
+            {
+              className: 'rdw-organic-row',
+              style: {
+                position: 'relative',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 7,
+                padding: '6px 9px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                background: isModSelected ? 'var(--rdw-organic-hover)' : 'transparent',
+                cursor: 'pointer',
+                transition: 'background .2s cubic-bezier(.4,0,.2,1)',
+              },
+              onClick: () => call(options.onSelectModule, mod.id),
+              onContextMenu: (event) => emitContextMenu(options, event, { kind: 'module', module: mod }),
+            },
+            // 选中左竖条（3px 鼠尾草，上下留白 22%）
+            isModSelected
+              ? h('span', {
+                  style: {
+                    position: 'absolute',
+                    left: 0,
+                    top: '22%',
+                    bottom: '22%',
+                    width: 3,
+                    borderRadius: '6px',
+                    background: 'var(--rdw-sage)',
+                  },
+                })
+              : null,
+            // 状态圆点（有机非正圆）
+            h('span', {
+              style: {
+                width: 7,
+                height: 7,
+                flex: '0 0 auto',
+                borderRadius: 'var(--rdw-r-dot)',
+                background: isCompleted ? 'var(--rdw-sage)' : 'var(--rdw-tan)',
+              },
+            }),
+            h(
+              'span',
+              {
+                style: {
+                  flex: 1,
+                  minWidth: 0,
+                  fontSize: 11.5,
+                  fontWeight: isModSelected ? 600 : 500,
+                  color: isModSelected ? 'var(--rdw-organic-ink)' : 'var(--rdw-organic-ink-2)',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                },
+              },
+              mod.name,
+            ),
+            h(
+              'span',
+              {
+                style: {
+                  fontFamily: 'var(--rdw-font-mono)',
+                  fontSize: 11,
+                  color: 'var(--rdw-organic-ink-3)',
+                  flex: '0 0 auto',
+                },
+              },
+              mod.id,
+            ),
+            isCompleted
+              ? h('span', { style: { fontSize: 12, color: 'var(--rdw-sage)', flex: '0 0 auto' } }, '✓')
+              : null,
+            h(
+              'button',
+              {
+                type: 'button',
+                style: {
+                  marginLeft: 'auto',
+                  padding: '1px 5px',
+                  borderRadius: 'var(--rdw-r-pebble-sm)',
+                  border: 'none',
+                  background: 'transparent',
+                  color: 'var(--rdw-sage)',
+                  fontSize: 12,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  opacity: 0.7,
+                },
+                title: `在「${mod.name}」阶段下分新刺`,
+                onClick: (e) => {
+                  if (e && e.stopPropagation) e.stopPropagation()
+                  call(options.onSprout, mod.id)
+                },
+              },
+              '+',
+            ),
+          ),
+          // 鱼刺分支（缩进 + 左侧细竖线，EvoResearch 的子项语言）
+          modRibs.length > 0
+            ? h(
+                'div',
+                {
+                  style: {
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 1,
+                    margin: '1px 0 4px 12px',
+                    paddingLeft: 8,
+                    borderLeft: '1.5px solid var(--rdw-warm-line-2)',
+                  },
+                },
+                ...modRibs.map((rib) => {
+                  const isRibSelected = selectedRibId === rib.id
+                  const theme = ribTheme(rib.status)
+
+                  return h(
+                    'div',
+                    {
+                      key: `v-rib-${rib.id}`,
+                      className: 'rdw-organic-row',
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 5,
+                        padding: '4px 7px',
+                        borderRadius: 'var(--rdw-r-pebble-sm)',
+                        background: isRibSelected ? 'var(--rdw-organic-hover)' : 'transparent',
+                        cursor: 'pointer',
+                        transition: 'background .2s cubic-bezier(.4,0,.2,1)',
+                      },
+                      title: rib.brief || rib.name,
+                      onClick: () => call(options.onSelectRib, rib),
+                      onContextMenu: (event) => emitContextMenu(options, event, { kind: 'rib', rib, module: mod }),
+                      onMouseEnter: (event) => emitHoverCard(options, event, rib),
+                      onMouseLeave: () => emitHoverCardLeave(options),
+                    },
+                    h('span', {
+                      style: {
+                        width: 5,
+                        height: 5,
+                        flex: '0 0 auto',
+                        borderRadius: 'var(--rdw-r-dot)',
+                        background: theme.color,
+                      },
+                    }),
+                    h(
+                      'span',
+                      {
+                        style: {
+                          flex: 1,
+                          minWidth: 0,
+                          fontSize: 11,
+                          color: isRibSelected ? 'var(--rdw-organic-ink)' : 'var(--rdw-organic-ink-2)',
+                          fontWeight: isRibSelected ? 600 : 400,
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        },
+                      },
+                      rib.name,
+                    ),
+                    theme.label
+                      ? h(
+                          'span',
+                          {
+                            style: {
+                              flex: '0 0 auto',
+                              padding: '1px 6px',
+                              borderRadius: 'var(--rdw-r-pebble-sm)',
+                              fontSize: 11,
+                              fontWeight: 600,
+                              fontFamily: 'var(--rdw-font-mono)',
+                              color: theme.color,
+                              background: `color-mix(in srgb,${theme.color} 13%,transparent)`,
+                            },
+                          },
+                          theme.label,
+                        )
+                      : null,
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        style: {
+                          marginLeft: 2,
+                          padding: '0 3px',
+                          borderRadius: 'var(--rdw-r-pebble-sm)',
+                          border: 'none',
+                          background: 'transparent',
+                          color: 'var(--rdw-organic-ink-3)',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                          opacity: isRibSelected ? 0.9 : 0.4,
+                        },
+                        title: `以「${rib.name}」分出二级子刺`,
+                        onClick: (e) => {
+                          if (e && e.stopPropagation) e.stopPropagation()
+                          call(options.onSprout, rib.module, rib.id)
+                        },
+                      },
+                      '+',
+                    ),
+                  )
+                }),
+              )
+            : null,
+        )
+      }),
+    ),
+    // 底部分隔线 + 操作区（EvoResearch 底部工具区语言）
+    h('div', { style: { height: 1, background: 'var(--rdw-warm-line-2)', margin: '2px 4px' } }),
+    h(
+      'div',
+      { style: { display: 'flex', gap: 6, padding: '0 2px' } },
+      h(
+        'button',
+        {
+          type: 'button',
+          style: {
+            flex: 1,
+            padding: '6px 0',
+            borderRadius: 'var(--rdw-r-pebble-sm)',
+            border: '1px solid var(--rdw-warm-line)',
+            background: 'var(--rdw-organic-input)',
+            color: 'var(--rdw-organic-ink-2)',
+            fontSize: 11,
+            fontWeight: 500,
+            cursor: 'pointer',
+            transition: 'all .2s cubic-bezier(.4,0,.2,1)',
+          },
+          disabled: Boolean(options.busy),
+          title: '自动回连全部已满意的鱼刺',
+          onClick: () => call(options.onAuto),
+        },
+        '自动回连',
+      ),
+      h(
+        'button',
+        {
+          type: 'button',
+          style: {
+            flex: 1.3,
+            padding: '6px 0',
+            borderRadius: 'var(--rdw-r-pebble-sm)',
+            border: 'none',
+            background: 'var(--rdw-soil)',
+            color: '#faf6f1',
+            fontSize: 11,
+            fontWeight: 600,
+            cursor: 'pointer',
+            transition: 'all .2s cubic-bezier(.4,0,.2,1)',
+            boxShadow: 'var(--rdw-shadow-organic-1)',
+          },
+          disabled: Boolean(options.busy),
+          title: '在此模块下分一根新刺',
+          onClick: () => call(options.onSprout, selectedModId, selectedRibId),
+        },
+        '🌱 分一根新刺',
+      ),
+    ),
+  )
+
+  // 2. 中栏 · 当前工作区
+  //    参照 EvoResearch 的对话主区：纸面留白、衬线大标题、气泡式消息、
+  //    有机 pebble 卡片；会话区用 blob 大圆角承载。
+  const sessionData = options.ribWork || (options.session && options.session.data) || null
+  const entries = (sessionData && Array.isArray(sessionData.directivesParsed)) ? sessionData.directivesParsed : []
+  const sessionSections = (sessionData && Array.isArray(sessionData.sessionParsed)) ? sessionData.sessionParsed : []
+  const parentRibId = (sessionData && sessionData.parent) || activeRib.parent || null
+  const messageAnchor = (activeRib && activeRib.origin && activeRib.origin.kind === 'message') ? activeRib.origin.anchor : null
+  const contextText = (sessionData && sessionData.context) || ''
+  const briefText = (sessionData && sessionData.brief) || activeRib.brief || ''
+  const hasPriorContext = Boolean(parentRibId || messageAnchor || contextText || (activeRib.origin && activeRib.origin.kind))
+  const hasDialogue = entries.length > 0
+
+  const middleTab = options.middleTab || 'chat' // 'chat' | 'trace'
+  const middleMode = options.middleMode || 'auto' // 'auto' | 'native'
+  const showNativeLive = middleMode === 'native' || Boolean(options.conversationNode)
+
+  const priorContextNode = hasPriorContext
+    ? h(
+        'div',
+        { className: 'rdw-chat-context-card', style: { marginBottom: 6, flexShrink: 0 } },
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, color: 'var(--rdw-sage)' } },
+          h('span', null, '📌'),
+          h('span', null, '前置上下文与派生原点'),
+        ),
+        messageAnchor
+          ? h(
+              'div',
+              { style: { color: 'var(--rdw-organic-ink-2)' } },
+              '📍 派生自会话消息：“',
+              h('span', { style: { fontStyle: 'italic' } }, String(messageAnchor.messageExcerpt || '').slice(0, 120)),
+              '”',
+            )
+          : null,
+        parentRibId
+          ? h(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: 6, color: 'var(--rdw-organic-ink-2)' } },
+              '🌿 派生自父刺：',
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: {
+                    padding: '1px 6px',
+                    borderRadius: 'var(--rdw-r-pebble-sm)',
+                    border: '1px solid var(--rdw-warm-line)',
+                    background: 'var(--rdw-organic-surface)',
+                    fontSize: 11,
+                    cursor: 'pointer',
+                    fontFamily: 'var(--rdw-font-mono)',
+                  },
+                  onClick: () => {
+                    const parentRib = ribs.find((r) => r.id === parentRibId)
+                    if (parentRib) call(options.onSelectRib, parentRib)
+                  },
+                },
+                parentRibId,
+              ),
+              h('span', { style: { color: 'var(--rdw-organic-ink-3)', fontSize: 11 } }, '（承袭前序阶段研究产物）'),
+            )
+          : null,
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap', marginTop: 3 } },
+          h(
+            'span',
+            { style: { color: 'var(--rdw-organic-ink-2)', fontSize: 11 } },
+            contextText ? '📄 已挂载主骨上下文档案快照 (CONTEXT.md)' : '📄 鱼刺任务上下文',
+          ),
+          h(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'rdw-organic-btn',
+                style: {
+                  padding: '2px 8px',
+                  borderRadius: 'var(--rdw-r-pebble-sm)',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: '#faf6f1',
+                  background: 'var(--rdw-sage)',
+                  border: 'none',
+                  cursor: 'pointer',
+                },
+                title: '将当前鱼刺的研究目标、所属阶段与上下文档案注入会话框，让 AI 智能体掌握当前上下文',
+                onClick: () => call(options.onMountContext, { module: activeModule.id, branch: activeRib.id }),
+              },
+              '⚡ 注入上下文到对话',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'rdw-organic-btn',
+                style: {
+                  padding: '2px 8px',
+                  borderRadius: 'var(--rdw-r-pebble-sm)',
+                  fontSize: 11,
+                  fontWeight: 500,
+                  color: 'var(--rdw-teal-ink)',
+                  background: 'color-mix(in srgb,var(--rdw-teal) 14%,transparent)',
+                  border: '1px solid color-mix(in srgb,var(--rdw-teal) 32%,transparent)',
+                  cursor: 'pointer',
+                },
+                title: '从当前对话自动分叉创建新鱼刺',
+                onClick: () => call(options.onAutoSprout, activeRib.brief || activeRib.name),
+              },
+              '🌱 自动分新刺',
+            ),
+          ),
+        ),
+      )
+    : null
+
+  const middlePane = h(
+    'div',
+    {
+      className: 'rdw-pane-middle',
+      style: {
+        margin: 0,
+        padding: '12px 14px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 9,
+        /* 中栏是 grid 子项：min-height:0 让它可收缩，
+         * align-self:stretch（默认）让它撑满整行高度。
+         * 不要写 height:100%——grid 项用百分比高度在部分浏览器下
+         * 会以内容高度为基准循环，导致内部 100% 子树塌陷。 */
+        minHeight: 0,
+        overflow: 'hidden',
+        background: 'var(--rdw-organic-surface)',
+        border: '1px solid var(--rdw-warm-line-2)',
+        borderRadius: 'var(--rdw-r-blob)',
+        boxShadow: 'var(--rdw-shadow-organic-1)',
+      },
+    },
+    // 中栏顶部：紧凑优雅的工作区标题栏（Apple OS 规范：扁平微通透，主次分明）
+    h(
+      'div',
+      {
+        style: {
+          padding: '2px 4px 6px',
+          borderBottom: '1px solid var(--rdw-warm-line-2)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+        },
+      },
+      h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: 9, minWidth: 0 } },
+        h(
+          'div',
+          {
+            style: {
+              fontFamily: 'var(--rdw-font)',
+              fontSize: 16.5,
+              fontWeight: 600,
+              letterSpacing: '-.015em',
+              color: 'var(--rdw-organic-ink)',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            },
+          },
+          activeRib.name || '当前任务工作区',
+        ),
+        h(
+          'span',
+          {
+            style: {
+              padding: '1px 7px',
+              borderRadius: 'var(--rdw-r-pebble-sm)',
+              fontSize: 11,
+              fontWeight: 600,
+              color: 'var(--rdw-teal-ink)',
+              background: 'color-mix(in srgb,var(--rdw-teal) 14%,transparent)',
+              border: '1px solid color-mix(in srgb,var(--rdw-teal) 26%,transparent)',
+              flex: '0 0 auto',
+            },
+          },
+          activeRib.id || '主线任务',
+        ),
+      ),
+      h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' } },
+        h(
+          'span',
+          {
+            style: {
+              padding: '2px 8px',
+              borderRadius: 'var(--rdw-r-pebble-sm)',
+              fontSize: 11.5,
+              fontWeight: 600,
+              color: 'var(--rdw-sage)',
+              background: 'color-mix(in srgb,var(--rdw-sage-tint) 16%,transparent)',
+              border: '1px solid color-mix(in srgb,var(--rdw-sage-tint) 32%,transparent)',
+            },
+          },
+          activeModule.name || '统计分析',
+        ),
+        // v3.6 锚点提示：如果当前鱼刺是从消息分叉来的，给一个「📍 源消息」提示
+        activeRib && activeRib.origin && activeRib.origin.kind === 'message'
+          ? h(
+              'span',
+              {
+                className: 'rdw-msg-anchor',
+                title: activeRib.origin.anchor && activeRib.origin.anchor.messageExcerpt
+                  ? `源消息：${activeRib.origin.anchor.messageExcerpt}`
+                  : '从会话消息分叉而来',
+              },
+              '📍 消息',
+            )
+          : null,
+      ),
+    ),
+    // 任务情境综合条（Apple 拟态微卡片：整合智能体、Dock快照、下一步与阻塞，高度紧凑节省 ~250px 纵向空间）
+    h(
+      'div',
+      {
+        style: {
+          padding: '7px 11px',
+          borderRadius: 'var(--rdw-r-pebble)',
+          background: 'var(--rdw-fill-quat)',
+          border: '1px solid var(--rdw-warm-line-2)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+        },
+      },
+      // 状态与身份行
+      h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+          h('span', null, '🤖'),
+          h('strong', { style: { fontWeight: 600, color: 'var(--rdw-organic-ink)' } }, `${activeModule.name || '统计分析'}智能体`),
+          h('span', { style: { width: 6, height: 6, borderRadius: '50%', background: 'var(--rdw-sys-green)' } }),
+          h('span', { style: { color: 'var(--rdw-organic-ink-3)', fontSize: 11.5 } }, '· 🧬 科研记忆 Dock 已挂载'),
+        ),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          blockers.length > 0
+            ? h(
+                'span',
+                {
+                  style: {
+                    padding: '1px 6px',
+                    borderRadius: 'var(--rdw-r-pebble-sm)',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: 'var(--rdw-sys-orange)',
+                    background: 'color-mix(in srgb,var(--rdw-sys-orange) 14%,transparent)',
+                  },
+                  title: blockers.map((b) => (typeof b === 'object' ? b.reason || b.name : b)).join('；'),
+                },
+                `⊘ ${blockers.length} 阻塞信号`,
+              )
+            : null,
+          nextSteps.length > 0
+            ? h(
+                'span',
+                {
+                  style: {
+                    padding: '1px 6px',
+                    borderRadius: 'var(--rdw-r-pebble-sm)',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: 'var(--rdw-sage)',
+                    background: 'color-mix(in srgb,var(--rdw-sage-tint) 14%,transparent)',
+                  },
+                  title: nextSteps.map((st) => (typeof st === 'object' ? st.title || st.name : st)).join('；'),
+                },
+                '🐟 主骨下一步',
+              )
+            : null,
+        ),
+      ),
+      // 任务简要目标与下一步提示
+      h(
+        'div',
+        {
+          style: {
+            fontSize: 11.5,
+            color: 'var(--rdw-organic-ink-2)',
+            lineHeight: 1.45,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          },
+          title: activeRib.brief || '',
+        },
+        activeRib.brief || (sessionData && sessionData.brief) || `${activeModule.name || '阶段'}探索任务：推进 ${activeRib.name || activeRib.id} 的分析与成果输出。`,
+      ),
+    ),
+    // 中栏主体：交互式会话框（对标原生对话与轨迹设计）
+    h(
+      'div',
+      {
+        style: {
+          flex: '1 1 auto',
+          height: 0,
+          minHeight: 320,
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+          borderRadius: 'var(--rdw-r-blob)',
+          background: 'var(--rdw-organic-surface)',
+          border: '1px solid var(--rdw-warm-line)',
+          marginTop: 2,
+          padding: '8px 12px 10px',
+          boxShadow: 'var(--rdw-shadow-organic-1)',
+        },
+      },
+      // 1. 原生风格选项卡头（对标第三图结构：对话 | 轨迹）
+      h(
+        'div',
+        { className: 'rdw-chat-tabs-bar' },
+        h(
+          'div',
+          { className: 'rdw-chat-tabs' },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: `rdw-chat-tab ${middleTab === 'chat' ? 'active' : ''}`,
+              onClick: () => call(options.onSelectMiddleTab, 'chat'),
+            },
+            '对话',
+            entries.length > 0
+              ? h('span', { style: { marginLeft: 5, fontSize: 11, opacity: 0.7 } }, `(${entries.length})`)
+              : null,
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: `rdw-chat-tab ${middleTab === 'trace' ? 'active' : ''}`,
+              onClick: () => call(options.onSelectMiddleTab, 'trace'),
+            },
+            '轨迹',
+            sessionSections.length > 0
+              ? h('span', { style: { marginLeft: 5, fontSize: 11, opacity: 0.7 } }, `(${sessionSections.length})`)
+              : null,
+          ),
+        ),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } },
+          options.conversationNode
+            ? h(
+                'span',
+                {
+                  style: {
+                    padding: '2px 8px',
+                    borderRadius: 'var(--rdw-r-pebble-sm)',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: 'var(--rdw-sage)',
+                    background: 'color-mix(in srgb,var(--rdw-sage-tint) 16%,transparent)',
+                    border: '1px solid color-mix(in srgb,var(--rdw-sage-tint) 32%,transparent)',
+                  },
+                },
+                '⚡ 原生交互式会话',
+              )
+            : null,
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'rdw-organic-btn',
+              style: {
+                padding: '2px 8px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                fontSize: 11,
+                fontWeight: 600,
+                color: 'var(--rdw-teal-ink)',
+                background: 'color-mix(in srgb,var(--rdw-teal) 14%,transparent)',
+                border: '1px solid color-mix(in srgb,var(--rdw-teal) 32%,transparent)',
+                cursor: 'pointer',
+              },
+              title: '将当前鱼刺的完整上下文同步挂载并注入至会话框',
+              onClick: () => call(options.onMountContext, { module: activeModule.id, branch: activeRib.id }),
+            },
+            '⚡ 注入上下文',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'rdw-organic-btn',
+              style: {
+                padding: '2px 8px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                fontSize: 11,
+                fontWeight: 600,
+                color: 'var(--rdw-soil)',
+                background: 'color-mix(in srgb,var(--rdw-soil) 12%,transparent)',
+                border: '1px solid color-mix(in srgb,var(--rdw-soil) 32%,transparent)',
+                cursor: 'pointer',
+              },
+              title: '从当前对话自动分叉创建新鱼刺',
+              onClick: () => call(options.onAutoSprout, activeRib.brief || activeRib.name),
+            },
+            '🌱 对话自动分刺',
+          ),
+          h(
+            'span',
+            { style: { fontSize: 11.5, color: 'var(--rdw-organic-ink-3)', whiteSpace: 'nowrap' } },
+            '选中文字可分叉',
+          ),
+        ),
+      ),
+      // 2. 原生会话节点挂载槽位（卡片已按用户要求隐藏以节省纵向屏幕空间，保持节点常驻 DOM）
+      options.conversationNode
+        ? h(
+            'div',
+            {
+              className: 'rdw-native-slot',
+              style: {
+                display: middleTab === 'chat' ? 'flex' : 'none',
+                flex: '1 1 auto',
+                height: 0,
+                minHeight: 0,
+                overflow: 'hidden',
+                flexDirection: 'column',
+                position: 'relative',
+              },
+              onMouseUp: (event) => {
+                if (typeof options.onShowMessageSprout !== 'function') return
+                if (typeof window === 'undefined' || typeof window.getSelection !== 'function') return
+                const sel = window.getSelection()
+                const text = sel && typeof sel.toString === 'function' ? sel.toString().trim() : ''
+                if (!text || text.length < 4) return
+                let px = event.clientX
+                let py = event.clientY
+                try {
+                  if (sel.rangeCount > 0) {
+                    const rect = sel.getRangeAt(0).getBoundingClientRect()
+                    if (rect) { px = rect.right; py = rect.bottom + 6 }
+                  }
+                } catch { /* ignore */ }
+                options.onShowMessageSprout({ excerpt: text, x: px, y: py })
+              },
+              onContextMenu: (event) => {
+                if (typeof options.onContextMenu !== 'function') return
+                let excerpt = ''
+                if (typeof window !== 'undefined' && window.getSelection) {
+                  const sel = window.getSelection()
+                  if (sel && sel.toString().trim()) excerpt = sel.toString().trim()
+                }
+                if (!excerpt && event.target) {
+                  const p = event.target.closest('p, div, li, blockquote, [role="article"]')
+                  if (p && p.innerText) excerpt = p.innerText.trim().slice(0, 300)
+                }
+                if (excerpt) {
+                  event.preventDefault()
+                  if (event.stopPropagation) event.stopPropagation()
+                  options.onContextMenu({
+                    x: event.clientX,
+                    y: event.clientY,
+                    target: { kind: 'conversation-message', excerpt },
+                  })
+                }
+              },
+            },
+            options.conversationNode,
+          )
+        : null,
+      // 4. 轨迹标签页（中栏主体：显示执行推理记录与尝试轨迹）
+      middleTab === 'trace'
+        ? h(
+            'div',
+            {
+              className: 'rdw-trace-stream',
+            },
+            sessionSections.length > 0
+              ? sessionSections.map((sec, idx) =>
+                  h(
+                    'div',
+                    { key: `sec-${idx}`, className: 'rdw-trace-card' },
+                    h(
+                      'div',
+                      { className: 'rdw-trace-card-title' },
+                      h('span', null, idx === 0 ? '🎯' : idx === 1 ? '🧠' : idx === 2 ? '🔍' : '📦'),
+                      h('span', null, sec.title || `第 ${idx + 1} 阶段执行记录`),
+                    ),
+                    h('div', { className: 'rdw-trace-card-body' }, sec.text || ''),
+                  ),
+                )
+              : h(
+                  'div',
+                  { style: { padding: '24px 10px', textAlign: 'center', color: 'var(--rdw-organic-ink-3)', fontSize: 12 } },
+                  '暂无执行推理记录。智能体在执行任务时将自动沉淀尝试轨迹与评估意见。',
+                ),
+          )
+        : null,
+      // 5. 兜底回退模式（当环境未提供原生 conversationNode 且在对话页时，展示纯自绘对话记录与输入区）
+      !options.conversationNode && middleTab === 'chat'
+        ? h(
+            'div',
+            {
+              style: {
+                flex: '1 1 auto',
+                height: 0,
+                minHeight: 0,
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+              },
+            },
+            priorContextNode,
+            // 会话消息或上下文流
+            h(
+              'div',
+              {
+                className: 'rdw-chat-stream',
+                onMouseUp: (event) => {
+                  if (typeof options.onShowMessageSprout !== 'function') return
+                  if (typeof window === 'undefined' || typeof window.getSelection !== 'function') return
+                  const sel = window.getSelection()
+                  const text = sel && typeof sel.toString === 'function' ? sel.toString().trim() : ''
+                  if (!text || text.length < 4) return
+                  let px = event.clientX
+                  let py = event.clientY
+                  try {
+                    if (sel.rangeCount > 0) {
+                      const rect = sel.getRangeAt(0).getBoundingClientRect()
+                      if (rect) { px = rect.right; py = rect.bottom + 6 }
+                    }
+                  } catch { /* ignore */ }
+                  options.onShowMessageSprout({ excerpt: text, x: px, y: py })
+                },
+              },
+              // 对话往来记录
+              hasDialogue
+                ? entries.map((entry, index) => {
+                    const isUser = entry.side === 'human' || entry.role === 'human'
+                    return h(
+                      'div',
+                      {
+                        key: `msg-${index}`,
+                        className: `rdw-chat-bubble ${isUser ? 'user' : 'agent'}`,
+                      },
+                      h(
+                        'div',
+                        {
+                          className: 'rdw-chat-bubble-header',
+                          style: { justifyContent: isUser ? 'flex-end' : 'flex-start' },
+                        },
+                        h('span', { style: { fontWeight: 600 } }, isUser ? '👤 你' : `🤖 ${activeModule.name || '统计'}智能体`),
+                        entry.at ? h('span', null, String(entry.at).slice(11, 19) || entry.at) : null,
+                      ),
+                      h('div', { className: 'rdw-chat-bubble-body' }, entry.text || ''),
+                    )
+                  })
+                : (!hasPriorContext
+                    ? h(
+                        'div',
+                        { className: 'rdw-chat-empty' },
+                        h(
+                          'div',
+                          { className: 'rdw-chat-empty-title' },
+                          h('span', null, '🐟'),
+                          h('span', null, '探索未至之境'),
+                          h(
+                            'span',
+                            {
+                              style: {
+                                fontSize: 11,
+                                padding: '1px 6px',
+                                borderRadius: 10,
+                                background: 'color-mix(in srgb,var(--rdw-teal) 16%,transparent)',
+                                color: 'var(--rdw-teal-ink)',
+                                fontWeight: 600,
+                              },
+                            },
+                            '预览版',
+                          ),
+                        ),
+                        h(
+                          'div',
+                          { className: 'rdw-chat-empty-meta' },
+                          h('span', null, `📁 ${options.projectTitle || 'dakesoftware'}`),
+                          h('span', null, '·'),
+                          h('span', null, '⚙ PTC 模式'),
+                        ),
+                        h(
+                          'div',
+                          { style: { fontSize: 12, color: 'var(--rdw-organic-ink-3)', maxWidth: '36ch', lineHeight: 1.6 } },
+                          '向当前探索智能体下达指令，开启本鱼刺的科学探索',
+                        ),
+                      )
+                    : h(
+                        'div',
+                        { style: { padding: '20px 10px', textAlign: 'center', color: 'var(--rdw-organic-ink-3)', fontSize: 12 } },
+                        '已成功承袭前序上下文。在下方输入框中写下你的第一条研究指令。',
+                      )),
+            ),
+            // 底部原生输入栏
+            h(
+              'div',
+              { className: 'rdw-chat-composer' },
+              h('textarea', {
+                placeholder: '发送消息或创建任务，/ 调用指令，@ 文件或对话',
+                value: draft,
+                onChange: (e) => call(options.onDraftChange, e && e.target ? e.target.value : ''),
+                onKeyDown: (e) => {
+                  if (e && e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    if (draft.trim()) call(options.onSendDirective, draft.trim())
+                  }
+                },
+              }),
+              h(
+                'div',
+                { className: 'rdw-chat-composer-bar' },
+                h(
+                  'div',
+                  { className: 'rdw-chat-composer-pills' },
+                  h('button', { type: 'button', className: 'rdw-chat-composer-pill', title: '添加附件/上下文' }, '+'),
+                  h('button', { type: 'button', className: 'rdw-chat-composer-pill' }, '🛡 完全权限 ▾'),
+                  h('button', { type: 'button', className: 'rdw-chat-composer-pill' }, `${options.composerModel || 'Gemini 3.8 Flash High'} ▾`),
+                ),
+                h(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                  h('button', { type: 'button', style: { border: 'none', background: 'none', fontSize: 14, cursor: 'pointer', opacity: 0.6 } }, '🎙'),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'rdw-chat-composer-send',
+                      disabled: !draft.trim() || sending,
+                      title: '发送指令 (Enter)',
+                      onClick: () => draft.trim() && call(options.onSendDirective, draft.trim()),
+                    },
+                    sending ? '…' : '↑',
+                  ),
+                ),
+              ),
+            ),
+          )
+        : null,
+    ),
+  )
+  // 3. 右栏 · 结果面板（产物预览与合并）
+  //    参照 EvoResearch 的检查器面板（evo-inspector）：纸面留白、衬线小标题、
+  //    有机 pebble 产物条目、底部主操作按钮用陶土/石褐实色。
+  const rawFiles =
+    Array.isArray(activeRib.outputFiles) && activeRib.outputFiles.length > 0
+      ? activeRib.outputFiles
+      : Array.isArray(activeRib.workFiles) && activeRib.workFiles.length > 0
+        ? activeRib.workFiles
+        : null
+
+  const artifactList = rawFiles
+    ? rawFiles.slice(0, 5).map((f) => {
+        const fname = typeof f === 'string' ? f : f.name || f.path || '产物文件'
+        const ext = fname.includes('.') ? fname.split('.').pop().toLowerCase() : ''
+        const icon = ['r', 'py', 'js', 'sh', 'ts'].includes(ext)
+          ? '</>'
+          : ['csv', 'xlsx', 'xls', 'parquet'].includes(ext)
+            ? '📊'
+            : ['md', 'txt', 'doc', 'docx'].includes(ext)
+              ? '📝'
+              : ['png', 'jpg', 'svg', 'pdf'].includes(ext)
+                ? '🖼️'
+                : '📄'
+        const desc = f.size ? `${(f.size / 1024).toFixed(1)} KB · 产物输出` : '产物文件'
+        return { icon, title: fname, desc }
+      })
+    : [
+        { icon: '</>', title: `${activeRib.id || 'analysis'}_main.R`, desc: '分析代码 · 版本 v2' },
+        { icon: '📊', title: `${activeRib.name || '诊断报告'}`, desc: '表格 · 图形 · 指标' },
+        { icon: '📝', title: '方法学审查结论', desc: '结论与可信证据' },
+      ]
+
+  const rightPane = h(
+    'div',
+    {
+      style: {
+        margin: 0,
+        padding: '12px 12px 10px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 9,
+        minHeight: 0,
+        background: 'var(--rdw-organic-bg)',
+        backgroundImage: 'var(--rdw-organic-grain)',
+        border: '1px solid var(--rdw-warm-line-2)',
+        borderRadius: 'var(--rdw-r-blob)',
+      },
+    },
+    // 右栏标题（衬线）
+    h(
+      'div',
+      { style: { padding: '0 4px' } },
+      h(
+        'div',
+        {
+          style: {
+            fontFamily: 'var(--rdw-font-serif)',
+            fontSize: 16.5,
+            fontWeight: 600,
+            letterSpacing: '-.01em',
+            color: 'var(--rdw-organic-ink)',
+          },
+        },
+        '结果面板',
+      ),
+      h(
+        'div',
+        { style: { fontSize: 12, color: 'var(--rdw-organic-ink-3)', marginTop: 1 } },
+        '产物预览与合并',
+      ),
+    ),
+    // 产物列表小标题
+    h(
+      'div',
+      {
+        style: {
+          padding: '2px 6px 0',
+          fontSize: 12.5,
+          fontWeight: 600,
+          letterSpacing: '.3px',
+          textTransform: 'uppercase',
+          color: 'var(--rdw-organic-ink-3)',
+        },
+      },
+      '📁 本任务产物',
+    ),
+    // 产物条目
+    h(
+      'div',
+      { style: { display: 'flex', flexDirection: 'column', gap: 5 } },
+      ...artifactList.map((file, fIdx) =>
+        h(
+          'div',
+          {
+            key: `art-${fIdx}`,
+            className: 'rdw-organic-card',
+            style: {
+              padding: '7px 10px',
+              borderRadius: 'var(--rdw-r-pebble-sm)',
+              background: 'var(--rdw-organic-surface)',
+              border: '1px solid var(--rdw-warm-line-2)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 2,
+              cursor: 'pointer',
+              boxShadow: 'var(--rdw-shadow-organic-1)',
+            },
+            onClick: () => call(options.onOpenFile, file.title),
+            onContextMenu: (event) => emitContextMenu(options, event, { kind: 'artifact', file, rib: activeRib }),
+          },
+          h(
+            'div',
+            { style: { ...row, gap: 6 } },
+            h(
+              'span',
+              {
+                style: {
+                  fontFamily: 'var(--rdw-font-mono)',
+                  fontSize: 12,
+                  color: 'var(--rdw-tan-ink)',
+                  fontWeight: 700,
+                  flex: '0 0 auto',
+                },
+              },
+              file.icon,
+            ),
+            h(
+              'span',
+              {
+                style: {
+                  fontSize: 11.5,
+                  fontWeight: 600,
+                  color: 'var(--rdw-organic-ink)',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                },
+              },
+              file.title,
+            ),
+          ),
+          h(
+            'div',
+            { style: { fontSize: 11.5, color: 'var(--rdw-organic-ink-3)', paddingLeft: 22 } },
+            file.desc,
+          ),
+        ),
+      ),
+    ),
+    // 整合：需要你拍板或处理
+    attention.length > 0
+      ? h(
+          'div',
+          {
+            style: {
+              padding: '7px 10px',
+              borderRadius: 'var(--rdw-r-pebble-sm)',
+              background: 'color-mix(in srgb,var(--rdw-tan) 12%,var(--rdw-organic-surface))',
+              border: '1px solid color-mix(in srgb,var(--rdw-tan) 32%,transparent)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 4,
+            },
+          },
+          h(
+            'div',
+            { style: { ...row, gap: 5 } },
+            h('span', { style: { fontSize: 12.5 } }, '⚡'),
+            h(
+              'strong',
+              { style: { fontSize: 12.5, fontWeight: 700, color: 'var(--rdw-tan-ink)', letterSpacing: '.2px' } },
+              '需要你拍板或处理',
+            ),
+          ),
+          ...attention.slice(0, 4).map((item, aIdx) => {
+            const msg =
+              item.message ||
+              item.text ||
+              item.reason ||
+              item.title ||
+              (item.kind === 'decision'
+                ? item.stream ? `${item.stream} 等待拍板` : '有一项交接等待拍板'
+                : '上游版本变更，下游结果可能已过期')
+            return h(
+              'div',
+              {
+                key: `att-${aIdx}`,
+                style: { display: 'flex', gap: 6, alignItems: 'center', fontSize: 11.5, lineHeight: 1.5 },
+              },
+              h(
+                'span',
+                {
+                  style: {
+                    flex: '0 0 auto',
+                    padding: '1px 6px',
+                    borderRadius: 'var(--rdw-r-pebble-sm)',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: item.kind === 'stale' ? 'var(--rdw-st-rejected)' : 'var(--rdw-tan-ink)',
+                    background:
+                      item.kind === 'stale'
+                        ? 'color-mix(in srgb,var(--rdw-st-rejected) 13%,transparent)'
+                        : 'color-mix(in srgb,var(--rdw-tan) 22%,transparent)',
+                  },
+                },
+                item.kind === 'stale' ? '过期' : '待定',
+              ),
+              h(
+                'span',
+                {
+                  style: {
+                    color: 'var(--rdw-organic-ink-2)',
+                    flex: 1,
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  },
+                  title: msg,
+                },
+                msg,
+              ),
+            )
+          }),
+        )
+      : null,
+    // 阶段里程碑 / 交付物沉淀（展示主骨已锁定的科学证据资产）
+    (() => {
+      const milestoneList =
+        Array.isArray(markers) && markers.length > 0
+          ? markers
+          : spine
+              .filter((m) => pctOf(m) === 100 || m.status === 'ACCEPTED')
+              .map((m) => ({ stream: `${m.name} · 已验收`, version: 1 }))
+      if (milestoneList.length === 0) return null
+      return h(
+        'div',
+        {
+          style: {
+            padding: '7px 10px',
+            borderRadius: 'var(--rdw-r-pebble-sm)',
+            background: 'var(--rdw-fill-quat)',
+            border: '1px solid var(--rdw-warm-line-2)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+          },
+        },
+        h(
+          'div',
+          { style: { ...row, gap: 5 } },
+          h('span', { style: { fontSize: 12 } }, '🏁'),
+          h(
+            'strong',
+            { style: { fontSize: 12, fontWeight: 700, color: 'var(--rdw-organic-ink)', letterSpacing: '.2px' } },
+            '主骨里程碑沉淀',
+          ),
+        ),
+        ...milestoneList.slice(0, 3).map((ms, mIdx) =>
+          h(
+            'div',
+            {
+              key: `ms-${mIdx}`,
+              onContextMenu: (event) => emitContextMenu(options, event, { kind: 'marker', marker: ms }),
+              style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11.5, color: 'var(--rdw-organic-ink-2)', cursor: 'context-menu' },
+            },
+            h('span', { style: { color: 'var(--rdw-sys-green)', fontWeight: 700 } }, '✓'),
+            h(
+              'span',
+              {
+                style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                title: ms.stream || ms.name || '阶段成果',
+              },
+              ms.stream || ms.name || '阶段成果',
+            ),
+            ms.version
+              ? h(
+                  'span',
+                  {
+                    style: {
+                      fontFamily: 'var(--rdw-font-mono)',
+                      fontSize: 11,
+                      color: 'var(--rdw-organic-ink-3)',
+                      flex: '0 0 auto',
+                    },
+                  },
+                  `v${ms.version}`,
+                )
+              : null,
+          ),
+        ),
+      )
+    })(),
+    // 合并状态（底部固定区）
+    h(
+      'div',
+      {
+        style: {
+          marginTop: 'auto',
+          paddingTop: 9,
+          borderTop: '1px solid var(--rdw-warm-line-2)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 5,
+        },
+      },
+      h(
+        'div',
+        {
+          style: {
+            fontSize: 12.5,
+            fontWeight: 600,
+            letterSpacing: '.3px',
+            textTransform: 'uppercase',
+            color: 'var(--rdw-organic-ink-3)',
+          },
+        },
+        '合并状态',
+      ),
+      h(
+        'div',
+        { style: { ...row, gap: 6 } },
+        h(
+          'span',
+          {
+            style: {
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              padding: '2px 9px',
+              borderRadius: 'var(--rdw-r-pebble-sm)',
+              fontSize: 12,
+              fontWeight: 600,
+              color: 'var(--rdw-tan-ink)',
+              background: 'color-mix(in srgb,var(--rdw-tan) 20%,transparent)',
+              border: '1px solid color-mix(in srgb,var(--rdw-tan) 40%,transparent)',
+            },
+          },
+          h('span', {
+            style: {
+              width: 5,
+              height: 5,
+              borderRadius: 'var(--rdw-r-dot)',
+              background: 'var(--rdw-tan-ink)',
+            },
+          }),
+          '等待人工确认',
+        ),
+      ),
+      h(
+        'div',
+        { style: { fontSize: 12, color: 'var(--rdw-organic-ink-3)', lineHeight: 1.55 } },
+        '确认后选择需要回连主线的成果。',
+      ),
+      // 底部主操作按钮（石褐色实底 + 有机圆角 + 土色阴影）
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'rdw-organic-btn',
+          style: {
+            width: '100%',
+            marginTop: 5,
+            padding: '9px 0',
+            borderRadius: 'var(--rdw-r-pebble)',
+            border: 'none',
+            background: 'var(--rdw-soil)',
+            color: '#faf6f1',
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 6,
+            boxShadow: 'var(--rdw-shadow-organic-2)',
+            letterSpacing: '.01em',
+          },
+          disabled: Boolean(options.busy),
+          title: '审阅并确认成果，回连合并至主线',
+          onClick: () => call(options.onGraft, activeRib.id),
+        },
+        '审核与合并设计',
+      ),
+    ),
+  )
+
+  /* 三栏舞台内容：外壳 .rdw-stage 已是 CSS Grid 容器（左/中/右三列），
+   * 这里直接返回三个 pane，不再自建网格——避免嵌套两层网格导致栏宽失配。 */
+  const stageChildren = [leftPane, middlePane, rightPane]
+  // v3.5 快捷键与焦点：舞台本身可聚焦（tabIndex=0），键盘事件在这里统一捕获
+  const stageWrapperProps = {
+    className: 'rdw-fishbone-stage',
+    tabIndex: 0,
+    role: 'application',
+    'aria-label': '鱼骨工作台（按 ? 查看快捷键）',
+    onKeyDown: onStageKeyDown,
+    onContextMenu: (event) => {
+      // 空白处右键 = 画布菜单（仅当事件没被子元素消费时才走到这里）
+      emitContextMenu(options, event, { kind: 'canvas' })
+    },
+    style: { display: 'contents' },
+  }
+  if (options.standalone !== true) {
+    return h('div', stageWrapperProps, ...stageChildren)
+  }
+
+  const gridNode = h(
+    'div',
+    {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(228px, 258px) minmax(0, 1fr) minmax(218px, 246px)',
+        gap: 10,
+        alignItems: 'stretch',
+        minHeight: 540,
+      },
+    },
+    leftPane,
+    middlePane,
+    rightPane,
+  )
+  // standalone 场景也补快捷键包装
+  return h(
+    'div',
+    {
+      className: 'rdw-fishbone-stage',
+      tabIndex: 0,
+      onKeyDown: onStageKeyDown,
+      onContextMenu: (event) => emitContextMenu(options, event, { kind: 'canvas' }),
+      style: { display: 'contents' },
+    },
+    gridNode,
+  )
+}
+
+/**
+ * 递归分支树视图（对齐 EvoResearch 递归分支规范）。
+ * 支持从主脊骨任务节点到多级子鱼刺的无限深度树形展现与分叉操作。
+ */
+function renderRecursiveTree(h, spine, ribs, options) {
+  const { row, chip, button, primaryButton, muted } = STYLES
+  const call = (handler, ...args) => {
+    if (typeof handler === 'function') handler(...args)
+  }
+
+  const renderRibNode = (rib, depth = 0) => {
+    const theme = ribTheme(rib.status)
+    const childRibs = ribs.filter((r) => r.parent === rib.id)
+    const indent = depth * 22
+
+    return h(
+      'div',
+      { key: `rt-node-${rib.id}`, style: { display: 'flex', flexDirection: 'column', gap: 4, marginLeft: indent } },
+      h(
+        'div',
+        {
+          className: 'rdw-organic-card',
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 7,
+            padding: '6px 10px',
+            borderRadius: 'var(--rdw-r-pebble-sm)',
+            background: 'var(--rdw-organic-surface)',
+            border: '1px solid var(--rdw-warm-line-2)',
+            borderLeft: `3px solid ${theme.color}`,
+            boxShadow: 'var(--rdw-shadow-organic-1)',
+          },
+        },
+        h('span', { style: { fontSize: depth > 0 ? 11 : 13 } }, depth === 0 ? '🌿' : '↳ 🌱'),
+        h(
+          'span',
+          {
+            style: {
+              fontWeight: 600,
+              fontSize: 12,
+              color: 'var(--rdw-organic-ink)',
+              whiteSpace: 'nowrap',
+            },
+          },
+          rib.name || rib.id,
+        ),
+        h(
+          'span',
+          {
+            style: {
+              padding: '0 6px',
+              borderRadius: 'var(--rdw-r-pebble-sm)',
+              fontSize: 11,
+              fontFamily: 'var(--rdw-font-mono)',
+              color: 'var(--rdw-organic-ink-3)',
+              background: 'color-mix(in srgb,var(--rdw-mist) 42%,transparent)',
+              flex: '0 0 auto',
+            },
+          },
+          rib.id,
+        ),
+        rib.parent
+          ? h(
+              'span',
+              {
+                style: {
+                  padding: '0 6px',
+                  borderRadius: 'var(--rdw-r-pebble-sm)',
+                  fontSize: 11,
+                  color: 'var(--rdw-sage)',
+                  background: 'color-mix(in srgb,var(--rdw-sage-tint) 15%,transparent)',
+                  flex: '0 0 auto',
+                },
+              },
+              `↳ 父刺: ${rib.parent}`,
+            )
+          : null,
+        h(
+          'span',
+          {
+            style: {
+              padding: '1px 7px',
+              borderRadius: 'var(--rdw-r-pebble-sm)',
+              fontSize: 11.5,
+              fontWeight: 600,
+              color: theme.color,
+              background: 'color-mix(in srgb,' + theme.color + ' 12%,transparent)',
+              flex: '0 0 auto',
+            },
+          },
+          theme.label,
+        ),
+        rib.hasSession ? h('span', { style: { fontSize: 12 }, title: '有会话记录' }, '🧠') : null,
+        rib.is_stale ? h('span', { style: { fontSize: 12, color: 'var(--rdw-st-rejected)' }, title: '过期' }, '⚠') : null,
+        h(
+          'div',
+          { style: { ...row, gap: 5, marginLeft: 'auto' } },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'rdw-organic-btn',
+              style: {
+                padding: '2px 8px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                border: '1px solid var(--rdw-warm-line)',
+                background: 'var(--rdw-organic-input)',
+                color: 'var(--rdw-organic-ink-2)',
+                fontSize: 12.5,
+                cursor: 'pointer',
+              },
+              title: `以「${rib.name}」为父节点派生新的子分支`,
+              onClick: (e) => {
+                e.stopPropagation()
+                call(options.onSprout, rib.module, rib.id)
+              },
+            },
+            '🌱 分支',
+          ),
+          rib.stream && rib.status !== 'ACCEPTED' && rib.status !== 'REJECTED'
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  style: {
+                    padding: '2px 8px',
+                    borderRadius: 'var(--rdw-r-pebble-sm)',
+                    border: '1px solid color-mix(in srgb,var(--rdw-sage) 42%,transparent)',
+                    background: 'color-mix(in srgb,var(--rdw-sage-tint) 16%,transparent)',
+                    color: 'var(--rdw-sage)',
+                    fontSize: 12.5,
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  },
+                  title: '审阅满意后把交接结果接回直接父节点',
+                  onClick: (e) => {
+                    e.stopPropagation()
+                    call(options.onGraft, rib.id)
+                  },
+                },
+                '🪡 逐级回连',
+              )
+            : null,
+          h(
+            'button',
+            {
+              type: 'button',
+              style: {
+                padding: '2px 9px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                border: 'none',
+                background: 'var(--rdw-soil)',
+                color: '#faf6f1',
+                fontSize: 12.5,
+                fontWeight: 600,
+                cursor: 'pointer',
+              },
+              onClick: () => call(options.onSelectRib, rib),
+            },
+            '工作区 →',
+          ),
+        ),
+      ),
+      ...childRibs.map((child) => renderRibNode(child, depth + 1)),
+    )
+  }
+
+  return h(
+    'div',
+    { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '4px 0' } },
+    ...spine.map((mod) => {
+      const modRibs = ribs.filter((r) => r.module === mod.id && (!r.parent || !ribs.some((other) => other.id === r.parent)))
+      return h(
+        'div',
+        {
+          key: `tree-mod-${mod.id}`,
+          style: {
+            padding: '10px 12px',
+            borderRadius: 'var(--rdw-r-pebble)',
+            border: '1px solid var(--rdw-warm-line-2)',
+            background: 'var(--rdw-organic-surface)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 7,
+          },
+        },
+        h(
+          'div',
+          { style: { ...row, justifyContent: 'space-between', gap: 8 } },
+          h(
+            'div',
+            { style: { ...row, gap: 6, minWidth: 0 } },
+            h('span', { style: { fontSize: 13 } }, '🦴'),
+            h(
+              'strong',
+              {
+                style: {
+                  fontFamily: 'var(--rdw-font-serif)',
+                  fontSize: 13.5,
+                  fontWeight: 600,
+                  color: 'var(--rdw-organic-ink)',
+                  whiteSpace: 'nowrap',
+                },
+              },
+              `${mod.name} (${mod.id})`,
+            ),
+            h(
+              'span',
+              {
+                style: {
+                  padding: '1px 7px',
+                  borderRadius: 'var(--rdw-r-pebble-sm)',
+                  fontSize: 11.5,
+                  color: 'var(--rdw-organic-ink-3)',
+                  background: 'color-mix(in srgb,var(--rdw-mist) 46%,transparent)',
+                  flex: '0 0 auto',
+                },
+              },
+              `${mod.ribs ? mod.ribs.length : modRibs.length} 根鱼刺`,
+            ),
+            h(
+              'span',
+              {
+                style: {
+                  padding: '1px 7px',
+                  borderRadius: 'var(--rdw-r-pebble-sm)',
+                  fontSize: 11.5,
+                  fontWeight: 600,
+                  color: 'var(--rdw-sage)',
+                  background: 'color-mix(in srgb,var(--rdw-sage-tint) 16%,transparent)',
+                  flex: '0 0 auto',
+                },
+              },
+              `${pctOf(mod)}% 完成`,
+            ),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'rdw-organic-btn',
+              style: {
+                padding: '2px 9px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                border: '1px solid var(--rdw-warm-line)',
+                background: 'var(--rdw-organic-input)',
+                color: 'var(--rdw-organic-ink-2)',
+                fontSize: 12.5,
+                cursor: 'pointer',
+                flex: '0 0 auto',
+              },
+              title: `在此主骨阶段（${mod.name}）下创建新鱼刺`,
+              onClick: () => call(options.onSprout, mod.id),
+            },
+            '➕ 从此阶段分刺',
+          ),
+        ),
+        modRibs.length > 0
+          ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 5, paddingLeft: 6 } }, ...modRibs.map((rib) => renderRibNode(rib, 0)))
+          : h(
+              'div',
+              { style: { fontSize: 11, color: 'var(--rdw-organic-ink-3)', paddingLeft: 6 } },
+              '该主骨阶段尚未分出鱼刺。点击右侧「➕ 从此阶段分刺」开始探索。',
+            ),
+      )
+    }),
+  )
+}
+
+/**
+ * 鱼刺清单表格渲染函数。
+ */
+function renderRibsTable(h, visibleRibs, spine, options) {
+  const { chip, button } = STYLES
+  const call = (handler, ...args) => {
+    if (typeof handler === 'function') handler(...args)
+  }
+  const busy = typeof options.busy === 'string' ? options.busy : ''
+
+  return h(
+    'div',
+    { style: { ...STYLES.tableWrap } },
+    h(
+      'table',
+      { style: STYLES.table },
+      h(
+        'thead',
+        null,
+        h(
+          'tr',
+          null,
+          h('th', { style: STYLES.th }, '鱼刺'),
+          h('th', { style: STYLES.th }, '所属主骨'),
+          h('th', { style: STYLES.th }, '状态'),
+          h('th', { style: STYLES.th }, '产出'),
+          h('th', { style: STYLES.th }, '最近活动'),
+          h('th', { style: STYLES.th }, ''),
+        ),
+      ),
+      h(
+        'tbody',
+        null,
+        ...visibleRibs
+          .slice()
+          .sort((left, right) => {
+            const leftRank = RIB_RANK[left.status] ?? 9
+            const rightRank = RIB_RANK[right.status] ?? 9
+            if (leftRank !== rightRank) return leftRank - rightRank
+            return String(left.name) < String(right.name) ? -1 : 1
+          })
+          .map((rib) => {
+            const theme = ribTheme(rib.status)
+            const node = spine.find((item) => item.id === rib.module)
+            const fileCount = (rib.workFiles ? rib.workFiles.length : 0) + (rib.outputFiles ? rib.outputFiles.length : 0)
+            return h(
+              'tr',
+              {
+                key: `row-${rib.id}`,
+                onContextMenu: (event) => emitContextMenu(options, event, { kind: 'rib', rib, module: node }),
+                style: { cursor: 'context-menu' },
+              },
+              h(
+                'td',
+                { style: STYLES.td },
+                h(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                  h('span', { style: { color: theme.color, fontSize: 12 } }, theme.dot),
+                  h('span', { style: { fontWeight: 600, color: 'var(--rdw-text)' } }, rib.name),
+                  rib.parent ? h('span', { style: { ...chip, fontSize: 11.5, color: 'var(--rdw-sage)' } }, `↳ 父刺: `) : null,
+                  rib.hasSession ? h('span', { style: { fontSize: 12 }, title: '有会话记录' }, '🧠') : null,
+                  rib.is_stale ? h('span', { style: { fontSize: 12, color: 'var(--rdw-st-rejected)' }, title: '过期' }, '⚠') : null,
+                ),
+                rib.brief ? h('div', { style: { ...STYLES.muted, marginTop: 2 } }, truncate(rib.brief, 72)) : null,
+              ),
+              h('td', { style: STYLES.td }, node ? node.name : rib.module),
+              h(
+                'td',
+                { style: STYLES.td },
+                h(
+                  'span',
+                  {
+                    style: {
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      padding: '2px 8px',
+                      borderRadius: 'var(--rdw-r-pebble-sm)',
+                      fontSize: 12.5,
+                      fontWeight: 600,
+                      color: theme.color,
+                      background: 'color-mix(in srgb,' + theme.color + ' 12%,transparent)',
+                      border: '1px solid color-mix(in srgb,' + theme.color + ' 26%,transparent)',
+                      whiteSpace: 'nowrap',
+                    },
+                  },
+                  theme.label,
+                ),
+              ),
+              h('td', { style: { ...STYLES.td, fontVariantNumeric: 'tabular-nums' } }, `${fileCount} 个文件`),
+              h('td', { style: { ...STYLES.td, fontVariantNumeric: 'tabular-nums' } }, rib.lastActivityAt ? formatTimeText(rib.lastActivityAt) : '—'),
+              h(
+                'td',
+                { style: { ...STYLES.td, textAlign: 'right', whiteSpace: 'nowrap' } },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'rdw-organic-btn',
+                    style: {
+                      padding: '3px 9px',
+                      marginRight: 5,
+                      borderRadius: 'var(--rdw-r-pebble-sm)',
+                      border: '1px solid var(--rdw-warm-line)',
+                      background: 'var(--rdw-organic-input)',
+                      color: 'var(--rdw-organic-ink-2)',
+                      fontSize: 12.5,
+                      cursor: 'pointer',
+                    },
+                    title: `以「${rib.name}」为父节点派生新的子探索分支`,
+                    onClick: () => call(options.onSprout, rib.module, rib.id),
+                  },
+                  '🌱 分支',
+                ),
+                rib.stream && rib.status !== 'ACCEPTED' && rib.status !== 'REJECTED'
+                  ? h('button', {
+                      type: 'button',
+                      style: {
+                        padding: '3px 9px',
+                        marginRight: 5,
+                        borderRadius: 'var(--rdw-r-pebble-sm)',
+                        border: '1px solid color-mix(in srgb,var(--rdw-sage) 44%,transparent)',
+                        background: 'color-mix(in srgb,var(--rdw-sage-tint) 16%,transparent)',
+                        color: 'var(--rdw-sage)',
+                        fontSize: 12.5,
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      },
+                      disabled: Boolean(busy),
+                      title: '审阅后把该鱼刺的交接结果接回主骨',
+                      onClick: () => call(options.onGraft, rib.id),
+                    }, '回连')
+                  : null,
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'rdw-organic-btn',
+                    style: {
+                      padding: '3px 9px',
+                      borderRadius: 'var(--rdw-r-pebble-sm)',
+                      border: '1px solid var(--rdw-warm-line)',
+                      background: 'var(--rdw-organic-input)',
+                      color: 'var(--rdw-organic-ink-2)',
+                      fontSize: 12.5,
+                      cursor: 'pointer',
+                    },
+                    onClick: () => call(options.onSelectRib, rib),
+                  },
+                  '打开鱼刺',
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'rdw-organic-btn',
+                    style: {
+                      padding: '3px 7px',
+                      marginLeft: 5,
+                      borderRadius: 'var(--rdw-r-pebble-sm)',
+                      border: '1px solid color-mix(in srgb,var(--rdw-st-rejected) 24%,transparent)',
+                      background: 'transparent',
+                      color: 'var(--rdw-st-rejected)',
+                      fontSize: 11.5,
+                      cursor: 'pointer',
+                      opacity: 0.8,
+                    },
+                    title: `删除鱼刺「${rib.name}」到回收站`,
+                    onClick: (e) => {
+                      if (e && e.stopPropagation) e.stopPropagation()
+                      call(options.onDeleteRib, rib)
+                    },
+                  },
+                  '🗑',
+                ),
+              ),
+            )
+          }),
+      ),
+    ),
+  )
+}
+
+/**
+ * 渲染鱼骨主线视图。
+ * @param {object} h React.createElement
+ * @param {{fishbone?: object|null, loading?: boolean, error?: string,
+ *          selectedModule?: string|null, selectedRib?: string|null,
+ *          onSelectModule?: Function, onSelectRib?: Function,
+ *          onRefresh?: Function, onSprout?: Function, onAuto?: Function,
+ *          onGraft?: Function, busy?: string}} props
+ */
+export function renderFishboneView(h, props) {
+  const options = props && typeof props === 'object' ? props : {}
+  const { card, row, chip, muted, button, primaryButton, sectionTitle, mutedBox } = STYLES
+  const fishbone = options.fishbone && options.fishbone.ok !== false ? options.fishbone : null
+  const loading = Boolean(options.loading)
+  const error = typeof options.error === 'string' ? options.error : ''
+  const busy = typeof options.busy === 'string' ? options.busy : ''
+  const call = (handler, ...args) => {
+    if (typeof handler === 'function') handler(...args)
+  }
+
+  if (!fishbone) {
+    if (error) {
+      return h(
+        'div',
+        { style: card },
+        h('div', { style: { fontSize: 13, fontWeight: 700, marginBottom: 4 } }, '鱼骨主线读取失败'),
+        h('div', { style: { ...muted, marginBottom: 8 } }, error),
+        h('button', { type: 'button', style: primaryButton, disabled: loading, onClick: () => call(options.onRefresh) }, '重试'),
+      )
+    }
+    return h('div', { style: { ...muted, padding: '16px 0' } }, loading ? '正在读取项目主线…' : '还没有项目数据')
+  }
+
+  const head = fishbone.head && typeof fishbone.head === 'object' ? fishbone.head : {}
+  const spine = orderSpine(fishbone.spine, head.phase)
+  const ribs = Array.isArray(fishbone.ribs) ? fishbone.ribs : []
+  const attention = Array.isArray(fishbone.attention) ? fishbone.attention : []
+  const markers = Array.isArray(fishbone.markers) ? fishbone.markers : []
+  const totals = fishbone.totals && typeof fishbone.totals === 'object' ? fishbone.totals : {}
+  const nextSteps = Array.isArray(head.nextSteps) ? head.nextSteps : []
+  const blockers = Array.isArray(head.blockers) ? head.blockers : []
+  const cliErrors = Array.isArray(fishbone.cliErrors) ? fishbone.cliErrors : []
+
+  const selModule = options.selectedModule || null
+  const selRib = options.selectedRib || null
+  const displayMode = options.displayMode || 'canvas'
+  const visibleRibs = selModule ? ribs.filter((rib) => rib.module === selModule) : ribs
+
+  const ctx = { head, spine, ribs, totals, nextSteps, blockers, attention, markers, visibleRibs, selModule, selRib, displayMode, options, busy, cliErrors, muted, row }
+
+  /* v4 三栏舞台模式：只输出三栏（由外壳的 .rdw-stage 网格承载），
+   * 全景与鱼刺表通过 renderFishboneDrawer 单独渲染到底部抽屉里。 */
+  if (options.mode === 'stage') {
+    return renderEvoThreePaneWorkbench(h, { head, spine, ribs, totals, options, nextSteps, blockers, attention, markers })
+  }
+
+  /* v4 抽屉模式：只输出全景骨架 + 鱼刺清单表。 */
+  if (options.mode === 'drawer') {
+    return h(
+      'div',
+      { style: { display: 'flex', flexDirection: 'column', gap: 9 } },
+      h(
+        'div',
+        {
+          className: 'rdw-panorama',
+          style: { cursor: 'grab' },
+        },
+        renderFishSvg(h, spine, ribs, totals, {
+          ...options,
+          projectTitle: head.title,
+          projectGoal: head.goal,
+          selectedModule: selModule,
+          selectedRib: selRib,
+          compact: true,
+        }),
+      ),
+      visibleRibs.length > 0 ? renderRibsTable(h, visibleRibs, spine, options) : null,
+      cliErrors.length > 0
+        ? h('div', { style: { ...muted, fontSize: 12.5, padding: '4px 0' } }, `部分数据读取失败：${cliErrors.join('；')}`)
+        : null,
+    )
+  }
+
+  /* 兼容模式（单页纵向堆叠）：旧宿主或非 stage 场景下的完整鱼骨页。 */
+  return h(
+    'div',
+    { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+    /* --------------------------------------------- EvoResearch 三栏科研工作台（用户指定布局） */
+    renderEvoThreePaneWorkbench(h, { head, spine, ribs, totals, options, nextSteps, blockers, attention, markers }),
+
+    /* --------------------------------------------- 鱼刺清单与全景骨架（紧凑整合面板） */
+    h(
+      'div',
+      {
+        style: {
+          margin: 0,
+          padding: '12px 14px',
+          background: 'var(--rdw-organic-bg)',
+          backgroundImage: 'var(--rdw-organic-grain)',
+          border: '1px solid var(--rdw-warm-line-2)',
+          borderRadius: 'var(--rdw-r-blob)',
+        },
+      },
+      h(
+        'div',
+        { style: { ...row, justifyContent: 'space-between', marginBottom: 10, gap: 8 } },
+        h(
+          'div',
+          { style: { ...row, gap: 7, minWidth: 0 } },
+          h('span', { style: { fontSize: 12 } }, '📋'),
+          h(
+            'div',
+            {
+              style: {
+                fontFamily: 'var(--rdw-font-serif)',
+                fontSize: 15,
+                fontWeight: 600,
+                letterSpacing: '-.01em',
+                color: 'var(--rdw-organic-ink)',
+                whiteSpace: 'nowrap',
+              },
+            },
+            '鱼刺清单与全景骨架',
+          ),
+          h(
+            'span',
+            {
+              style: {
+                padding: '2px 9px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                fontSize: 11.5,
+                fontWeight: 600,
+                color: 'var(--rdw-sage)',
+                background: 'color-mix(in srgb,var(--rdw-sage-tint) 16%,transparent)',
+                border: '1px solid color-mix(in srgb,var(--rdw-sage-tint) 34%,transparent)',
+                flex: '0 0 auto',
+              },
+            },
+            `${ribs.length} 根 · Ishikawa 全景`,
+          ),
+        ),
+        h(
+          'div',
+          { style: { ...row, gap: 6, flex: '0 0 auto' } },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'rdw-organic-btn',
+              style: {
+                padding: '5px 12px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                border: '1px solid var(--rdw-warm-line)',
+                background: 'var(--rdw-organic-input)',
+                color: 'var(--rdw-organic-ink-2)',
+                fontSize: 11,
+                fontWeight: 500,
+                cursor: 'pointer',
+              },
+              disabled: Boolean(busy),
+              onClick: () => call(options.onAuto),
+            },
+            '自动回连',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              style: {
+                padding: '5px 13px',
+                borderRadius: 'var(--rdw-r-pebble-sm)',
+                border: 'none',
+                background: 'var(--rdw-soil)',
+                color: '#faf6f1',
+                fontSize: 11,
+                fontWeight: 600,
+                cursor: 'pointer',
+                boxShadow: 'var(--rdw-shadow-organic-1)',
+              },
+              disabled: Boolean(busy),
+              onClick: () => call(options.onSprout),
+            },
+            '🌱 分一根新刺',
+          ),
+        ),
+      ),
+      h(
+        'div',
+        {
+          className: 'rdw-organic-scroll',
+          style: {
+            overflowX: 'auto',
+            paddingBottom: 6,
+            marginBottom: 10,
+            borderRadius: 'var(--rdw-r-pebble)',
+            background: 'color-mix(in srgb,var(--rdw-mist) 22%,var(--rdw-organic-surface))',
+            border: '1px solid var(--rdw-warm-line-2)',
+          },
+        },
+        renderFishSvg(h, spine, ribs, totals, {
+          ...options,
+          projectTitle: head.title,
+          projectGoal: head.goal,
+          selectedModule: selModule,
+          selectedRib: selRib,
+        }),
+      ),
+      visibleRibs.length > 0 ? renderRibsTable(h, visibleRibs, spine, options) : null,
+    ),
+
+    cliErrors.length > 0
+      ? h('div', { style: { ...muted, fontSize: 12.5, padding: '4px 0' } }, `部分数据读取失败：${cliErrors.join('；')}`)
+      : null,
+  )
+}

@@ -1,0 +1,17 @@
+# dsh-research-dag-workbench — bundle layer
+#
+# 规范：https://dshdesktop.com/workbench/docs/development.md 第 3.3 节
+#   - 本文件是 YAML 数组；工作台通常只需要一条 insert。
+#   - id   = 插件条目 id（Harness 插件树中定位这一行）。
+#   - name = npm 包名（Node 靠它解析到安装的代码，不能写相对/绝对路径）。
+#
+# 该行不带 config：本插件 Config 的字段全部有可用默认值
+# （routePrefix 默认 /research-dag-workbench；工具包根目录默认按包自身位置解析），
+# 当前项目根持久化在 $DSH_HOME/research-dag-workbench/config.json。
+#
+# 若把工作台与其余代码拆开部署，在此处补一行 config 即可（patch 整体替换、不合并）：
+#     config:
+#       kitRoot: !!js dshHomePath('research-dag')
+- insert:
+    - id: research-dag-workbench
+      name: 'dsh-research-dag-workbench'
