@@ -30,12 +30,17 @@
   "files": [
     "lib/",
     "src/",
-    "docs/images/",
+    "tools/dag.mjs",
+    "tools/dag-core.mjs",
+    "tools/spur-context.mjs",
     "tools/build-client.mjs",
+    "integrations/",
+    "docs/images/",
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "DESIGN-workbench.md"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=0.1.5-rc.2 <0.2.0-0"

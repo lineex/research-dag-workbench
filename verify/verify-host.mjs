@@ -19,7 +19,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const BUNDLE = path.resolve(HERE, '..')
-const KIT_ROOT = path.resolve(BUNDLE, '..')
+const KIT_ROOT = fs.existsSync(path.join(path.resolve(BUNDLE, '..'), 'examples', 'early-phosphate'))
+  ? path.resolve(BUNDLE, '..')
+  : path.resolve(BUNDLE, '..', 'research-dag')
 const EXAMPLE = path.join(KIT_ROOT, 'examples', 'early-phosphate')
 const ROUTE = '/research-dag-workbench'
 

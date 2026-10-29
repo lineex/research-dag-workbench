@@ -942,12 +942,14 @@ export function createWorkbenchPanel(React) {
       if (!moduleId || !ribId) return null
 
       const myId = (injected.entry && injected.entry.id) || 'lineex/research-dag-workbench'
+      const activeSession = typeof hostService?.currentSession === 'function' ? hostService.currentSession() : null
+      const myRecent = hostService?.state?.recentSessions?.[myId]
       const curSession =
-        (typeof hostService?.currentSession === 'function' ? hostService.currentSession() : null) ||
-        hostService?.lastSession ||
-        hostService?.nativeLocation?.sessionId ||
-        hostService?.state?.recentSessions?.[myId] ||
-        null
+        (activeSession && typeof hostService?.ownsSession === 'function' && hostService.ownsSession(activeSession))
+          ? activeSession
+          : (myRecent && typeof hostService?.ownsSession === 'function' && hostService.ownsSession(myRecent))
+            ? myRecent
+            : null
 
       // 快速前置构造 prompt（确保点击后 0ms 立即注入输入框）
       const modObj = spine.find((m) => m.id === moduleId) || {}
@@ -1902,14 +1904,16 @@ export function createWorkbenchPanel(React) {
         try {
           if (hostService) {
             const myId = (injected.entry && injected.entry.id) || 'lineex/research-dag-workbench'
-            const cur =
-              (typeof hostService.currentSession === 'function' ? hostService.currentSession() : null) ||
-              hostService.lastSession ||
-              hostService.nativeLocation?.sessionId ||
-              hostService.state?.recentSessions?.[myId]
-            if (cur) {
-              if (typeof hostService.showSession === 'function') hostService.showSession(cur)
-              else if (typeof hostService.openSession === 'function') hostService.openSession(cur)
+            const activeSession = typeof hostService.currentSession === 'function' ? hostService.currentSession() : null
+            const myRecent = hostService.state?.recentSessions?.[myId]
+            const target = (activeSession && typeof hostService.ownsSession === 'function' && hostService.ownsSession(activeSession))
+              ? activeSession
+              : (myRecent && typeof hostService.ownsSession === 'function' && hostService.ownsSession(myRecent))
+                ? myRecent
+                : null
+            if (target) {
+              if (typeof hostService.showSession === 'function') hostService.showSession(target)
+              else if (typeof hostService.openSession === 'function') hostService.openSession(target)
             }
           }
         } catch {}
@@ -2325,80 +2329,85 @@ export function createWorkbenchPanel(React) {
       }
     }
 
-    /** 自动把当前打开的会话绑定到本工作台并真正开启展示（触发 uiWorkspace.openSession）。 */
+    /** 把当前无归属的未绑定会话绑定到本工作台；若该会话已属于其他工作台则明确拒绝，严禁越权覆盖。 */
     const attachCurrentSession = React.useCallback(async () => {
       if (!hostService) return
       try {
         const myId = (injected.entry && injected.entry.id) || 'lineex/research-dag-workbench'
-        const cur =
-          (typeof hostService.currentSession === 'function' ? hostService.currentSession() : null) ||
-          hostService.lastSession ||
-          hostService.nativeLocation?.sessionId ||
-          hostService.state?.recentSessions?.[myId] ||
-          'session-d57c7053-0ca9-4e2d-a4bb-fe93b220ffe7'
+        const cur = typeof hostService.currentSession === 'function' ? hostService.currentSession() : null
 
         if (!cur) {
+          // 当前没有任何激活会话，走宿主标准流程开启新会话
           startChat()
           return
         }
-        if (typeof hostService.commit === 'function') {
+
+        // 1. 如果当前会话已确认属于本工作台，直接激活展示
+        if (typeof hostService.ownsSession === 'function' && hostService.ownsSession(cur)) {
+          if (typeof hostService.showSession === 'function') hostService.showSession(cur)
+          else if (typeof hostService.openSession === 'function') hostService.openSession(cur)
+          return
+        }
+
+        // 2. 严格校验会话所有权：若已绑定到其他工作台，坚决拒绝接管或改绑（符合《工作台开发规范》第4-7节）
+        const bindings = hostService.state?.sessionBindings || {}
+        const existingOwner = bindings[cur]
+        if (existingOwner && existingOwner !== myId) {
+          setToast('该会话已归属于其他工作台，不可跨工作台改绑。请新建属于本工作台的会话。')
+          return
+        }
+
+        // 3. 当前会话属于未绑定会话（无 owner 或空白会话）：走宿主正式 API 进行关联
+        if (typeof hostService.ensureSession === 'function') {
+          await hostService.ensureSession({ sessionId: cur })
+        } else if (typeof hostService.commit === 'function') {
           await hostService.commit((state) => {
-            if (state) {
+            if (state && (!state.sessionBindings[cur] || state.sessionBindings[cur] === myId)) {
               state.sessionBindings[cur] = myId
               state.recentSessions[myId] = cur
             }
           })
         }
-        // 核心：调用 showSession / openSession，真正激活并载入该会话的对话历史到 DOM！
+
         if (typeof hostService.showSession === 'function') {
           hostService.showSession(cur)
         } else if (typeof hostService.openSession === 'function') {
           hostService.openSession(cur)
-        } else if (typeof hostService.ensureSession === 'function') {
-          await hostService.ensureSession({ sessionId: cur })
         }
       } catch (err) {
-        /* ignore */
+        setToast(`连接会话失败：${networkMessage(err)}`)
       }
-    }, [hostService, injected.entry, rootPath])
+    }, [hostService, injected.entry, startChat])
 
     const hasAttemptedAttach = React.useRef(false)
 
-    // 首屏自动检测：如果当前会话未激活，自动激活并嵌入（防抖且仅执行一次，避免无限循环）！
+    // 首屏自动检测：仅恢复确认归属于本工作台的会话；未确认或属于其他工作台时坚决不接管、不改绑、不自动创建！
     React.useEffect(() => {
       if (!hostService || hasAttemptedAttach.current) return
       hasAttemptedAttach.current = true
 
       try {
         const myId = (injected.entry && injected.entry.id) || 'lineex/research-dag-workbench'
-        const cur =
-          (typeof hostService.currentSession === 'function' ? hostService.currentSession() : null) ||
-          hostService.lastSession ||
-          hostService.nativeLocation?.sessionId ||
-          hostService.state?.recentSessions?.[myId] ||
-          'session-d57c7053-0ca9-4e2d-a4bb-fe93b220ffe7'
+        // 仅检查确认归属于本工作台的历史最近会话
+        const myRecent = hostService.state?.recentSessions?.[myId]
+        if (!myRecent) return
 
-        if (!cur) return
+        // 必须经由 hostService.ownsSession 严格确认属于本工作台
+        const isOwned = typeof hostService.ownsSession === 'function' && hostService.ownsSession(myRecent)
+        if (!isOwned) return
 
-        const isCurrentActive =
-          typeof hostService.ownsSession === 'function' &&
-          hostService.ownsSession(cur) &&
-          typeof hostService.currentSession === 'function' &&
-          hostService.currentSession() === cur
-
-        if (isCurrentActive) return
+        const cur = typeof hostService.currentSession === 'function' ? hostService.currentSession() : null
+        if (cur === myRecent) return
 
         if (typeof hostService.showSession === 'function') {
-          hostService.showSession(cur)
+          hostService.showSession(myRecent)
         } else if (typeof hostService.openSession === 'function') {
-          hostService.openSession(cur)
-        } else if (typeof hostService.ensureSession === 'function') {
-          hostService.ensureSession({ sessionId: cur }).catch(() => {})
+          hostService.openSession(myRecent)
         }
       } catch (err) {
         /* ignore */
       }
-    }, [hostService])
+    }, [hostService, injected.entry])
 
     /* --------------------------------------------------------------- 渲染 */
 
