@@ -28,6 +28,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "WorkbenchPanel.js",
     "lib/",
     "src/",
     "tools/dag.mjs",
